@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rdio
+      POSTGRES_USER: rdio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rdio -d rdio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:0.5.7
+    volumes:
+      - ollama-data:/root/.ollama
+    expose:
+      - "11434"
+    restart: unless-stopped
+  migrate:
+    build:
+      context: .
+      target: runtime
+    command: ["npm", "run", "db:migrate", "--workspace", "api"]
+    env_file: .env
+    environment:
+      JWT_SECRET: ""
+      BOOTSTRAP_ADMIN_EMAIL: ""
+      BOOTSTRAP_ADMIN_PASSWORD: ""
+      INGEST_API_KEY: ""
+      PUBLIC_AUDIO_SECRET: ""
+      WHISPER_API_KEY: ""
+      AI_API_KEY: ""
+      FACEBOOK_PAGE_ID: ""
+      FACEBOOK_ACCESS_TOKEN: ""
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+  api:
+    build:
+      context: .
+      target: runtime
+    command: ["node", "api/dist/server.js"]
+    env_file: .env
+    environment:
+      WHISPER_API_KEY: ""
+      AI_API_KEY: ""
+      FACEBOOK_PAGE_ID: ""
+      FACEBOOK_ACCESS_TOKEN: ""
+    volumes:
+      - audio-data:/data/audio
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: ["node", "api/dist/worker.js"]
+    env_file: .env
+    environment:
+      JWT_SECRET: ""
+      BOOTSTRAP_ADMIN_EMAIL: ""
+      BOOTSTRAP_ADMIN_PASSWORD: ""
+      INGEST_API_KEY: ""
+    volumes:
+      - audio-data:/data/audio
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      target: web-runtime
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  redis-data:
+  audio-data:
+  ollama-data:

@@ -47,6 +47,7 @@ setting('PUBLIC_AUDIO_SECRET', () => randomBytes(48).toString('base64url'));
 setting('INGEST_API_KEY', () => randomBytes(32).toString('base64url'));
 const adminEmail = setting('BOOTSTRAP_ADMIN_EMAIL', () => 'admin@localhost');
 const adminPassword = setting('BOOTSTRAP_ADMIN_PASSWORD', () => randomBytes(32).toString('base64url'), value => value.length >= 16 && !isPlaceholder(value));
+process.env.BOOTSTRAP_ADMIN_PASSWORD_GENERATED = String(adminPassword.generated);
 
 if (settingsChanged) {
 	const temporaryPath = `${secretsPath}.tmp`;

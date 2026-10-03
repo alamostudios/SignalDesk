@@ -3,3 +3,6 @@ dist/
 .env
 storage/
 coverage/
+data/.generated-secrets.json
+data/.generated-secrets.json.tmp
+data/initial-admin.txt

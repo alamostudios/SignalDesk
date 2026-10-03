@@ -4,14 +4,14 @@ A small developer-operated radio-call review app. SDRTrunk and Rdio Scanner run 
 
 ## Run Locally
 
-Requirements: Node.js 22+ and FFmpeg on `PATH`. Copy `.env.example` to `.env`, set the bootstrap email/password plus fresh `JWT_SECRET` and `PUBLIC_AUDIO_SECRET` values, then run:
+Requirements: Node.js 22+ and FFmpeg on `PATH`. Run:
 
 ```powershell
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. API and scanner receiver: `http://localhost:3000`. Migrations run automatically. Database files go in `data/`; audio goes in `storage/`.
+Open `http://localhost:5173`. API and scanner receiver: `http://localhost:3000`. Migrations run automatically. Database files go in `data/`; audio goes in `storage/`. On first run, signing keys and an admin password are generated automatically and saved under `data/`. Find the initial sign-in at `data/initial-admin.txt` and keep it private. A `.env` file is optional for overrides.
 
 If PowerShell cannot find `npm`, use `& 'C:\Program Files\nodejs\npm.cmd' install` and `& 'C:\Program Files\nodejs\npm.cmd' run dev`.
 
@@ -19,7 +19,7 @@ Whisper and reasoning AI are optional OpenAI-compatible endpoints configured wit
 
 ## One-Container Docker
 
-After configuring `.env`:
+To start without configuring secrets first:
 
 ```powershell
 docker compose up --build -d

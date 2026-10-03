@@ -4,7 +4,8 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       NODE_ENV: production
       DATA_DIR: /app/data

@@ -60,3 +60,22 @@ test('preserves an administrative jurisdiction and removes a name appended to it
     assert.equal(result.jurisdiction, 'Fulton County');
     assert.doesNotMatch(JSON.stringify(result), /Jane Doe/);
 });
+test('uses safe required-field labels when privacy redaction removes all content', () => {
+    const result = sanitizePublicPost({ ...sample, jurisdiction: 'Jane Doe', call: 'John Smith' });
+    assert.equal(result.jurisdiction, 'Jurisdiction withheld');
+    assert.equal(result.call, 'Details withheld');
+    assert.equal(publicPostSchema.safeParse(result).success, true);
+    assert.doesNotMatch(JSON.stringify(result), /Jane Doe|John Smith/);
+});
+test('manual posts can bypass privacy filters while schema validation remains active', () => {
+    const manualPost = {
+        ...sample,
+        jurisdiction: 'Jane Doe County',
+        call: 'John Smith at 42 Oak Road',
+        location: '123 Main Street',
+        extraInfo: 'Call Jane at 555-212-9898'
+    };
+    const result = sanitizePublicPost(manualPost, '', { applyPrivacyFilters: false });
+    assert.deepEqual(result, manualPost);
+    assert.equal(publicPostSchema.safeParse(result).success, true);
+});

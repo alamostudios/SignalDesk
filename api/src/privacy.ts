@@ -7,8 +7,9 @@ const emailPattern = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const probableNamePattern = /\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b/g;
 const jurisdictionMarkerPattern = /^(.+\b(?:county|parish|city|township|town|village|borough|state|district)\b)(.*)$/i;
 
-export function sanitizePublicPost(value: unknown, contextText = ''): PublicPost {
+export function sanitizePublicPost(value: unknown, contextText = '', options: { applyPrivacyFilters?: boolean } = {}): PublicPost {
   const candidate = publicPostSchema.parse(value);
+  if (options.applyPrivacyFilters === false) return candidate;
   if (blockedSensitivity.test(`${candidate.call} ${candidate.extraInfo} ${contextText}`)) {
     candidate.sensitivity = 'high';
     candidate.call = 'Sensitive incident';

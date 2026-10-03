@@ -60,10 +60,18 @@ async function processIncident(incidentId) {
             const pcmResult = await execFileAsync('ffmpeg', ['-nostdin', '-v', 'error', '-i', playablePath, '-f', 's16le', '-ac', '1', '-ar', '8000', '-'], { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024 });
             const configured = (process.env.PAGE_TONE_HZ ?? '').split(',').map(Number).filter(value => value > 0);
             const tone = detectConfiguredTones(pcmResult.stdout, 8000, configured, Number(process.env.PAGE_TONE_THRESHOLD ?? 0.18));
-            await query(`UPDATE incidents SET playable_path=$2,source_metadata=source_metadata || $3::jsonb,
-        event_type=CASE WHEN $4::boolean THEN 'tone' ELSE event_type END,updated_at=now() WHERE id=$1`, [incidentId, playableKey, { pageTone: tone }, tone.detected]);
+            const prepared = await query(`UPDATE incidents SET playable_path=$2,source_metadata=source_metadata || $3::jsonb,
+        event_type=CASE WHEN $4::boolean AND event_type <> 'manual' THEN 'tone' ELSE event_type END,updated_at=now()
+        WHERE id=$1 AND status='processing' RETURNING id`, [incidentId, playableKey, { pageTone: tone }, tone.detected]);
+            if (!prepared.rowCount)
+                return;
             const transcript = process.env.WHISPER_BASE_URL ? await transcriber.transcribe(await storage.read(playableKey)) : '';
-            await query('UPDATE incidents SET transcript=$2,updated_at=now() WHERE id=$1', [incidentId, transcript]);
+            await query("UPDATE incidents SET transcript=$2,updated_at=now() WHERE id=$1 AND status='processing'", [incidentId, transcript]);
+            if (incident.event_type === 'manual') {
+                await query(`UPDATE incidents SET playable_path=$2,transcript=$3,source_metadata=source_metadata || $4::jsonb,
+          status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, { pageTone: tone }]);
+                return;
+            }
             const images = await query('SELECT id, location, name FROM images WHERE enabled=true');
             const receivedAt = new Date(incident.received_at);
             const timeReceived = new Intl.DateTimeFormat('en-GB', { timeZone: process.env.TIME_ZONE ?? 'UTC', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(receivedAt) + ' hrs';
@@ -79,7 +87,7 @@ async function processIncident(incidentId) {
             const image = extraction ? images.rows.find(item => item.name === safe.suggestedImage || item.location.toLowerCase() === safe.jurisdiction.toLowerCase()) : undefined;
             safe.suggestedImage = image?.name ?? null;
             await query(`UPDATE incidents SET playable_path=$2,transcript=$3,internal_data=$4,public_data=$5,
-        image_id=$6,source_metadata=source_metadata || $7::jsonb,status='draft',updated_at=now() WHERE id=$1`, [incidentId, playableKey, transcript, privateData, publicPostSchema.parse(safe), image?.id ?? null, { pageTone: tone }]);
+        image_id=$6,source_metadata=source_metadata || $7::jsonb,status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, privateData, publicPostSchema.parse(safe), image?.id ?? null, { pageTone: tone }]);
         }
         finally {
             await Promise.allSettled(stagedSources.map(source => source.cleanup()));

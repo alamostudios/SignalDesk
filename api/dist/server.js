@@ -97,19 +97,16 @@ async function saveUpload(part, id, suffix) {
 async function bootstrapAdmin() {
     const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
     const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-    const productionInvalid = process.env.NODE_ENV === 'production' && (!email || !password || password.length < 16 || password.includes('change-this') ||
-        !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.includes('replace-with') ||
-        !process.env.PUBLIC_AUDIO_SECRET || process.env.PUBLIC_AUDIO_SECRET.length < 32 || process.env.PUBLIC_AUDIO_SECRET.includes('replace-with') ||
-        !process.env.PUBLIC_BASE_URL?.startsWith('https://'));
-    if (productionInvalid)
-        throw new Error('Production requires a unique admin password, 32+ character JWT/audio secrets, and HTTPS PUBLIC_BASE_URL');
-    if (!email || !password || password.length < 16 || !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-        return;
-    }
-    const existing = await query('SELECT id FROM users WHERE lower(email)=lower($1)', [email]);
+    if (!email || !password)
+        throw new Error('Admin credentials could not be initialized');
+    const existing = await query('SELECT id,password_hash FROM users WHERE lower(email)=lower($1)', [email]);
     if (!existing.rowCount) {
         await query('INSERT INTO users(email,password_hash,role) VALUES ($1,$2,\'Admin\')', [email.toLowerCase(), await bcrypt.hash(password, 12)]);
         app.log.info('Bootstrap administrator created');
+    }
+    else if (process.env.BOOTSTRAP_ADMIN_PASSWORD_GENERATED !== 'true' && !(await bcrypt.compare(password, existing.rows[0].password_hash))) {
+        await query('UPDATE users SET password_hash=$1 WHERE id=$2', [await bcrypt.hash(password, 12), existing.rows[0].id]);
+        app.log.info('Bootstrap administrator password synchronized from configuration');
     }
 }
 app.get('/api/health', async (_request, reply) => {
@@ -125,10 +122,10 @@ app.post('/api/post-preview', { preHandler: [requireRoles(...roles)] }, async (r
     const input = z.object({ incidentId: z.string().uuid().optional(), publicData: publicPostSchema }).strict().safeParse(request.body);
     if (!input.success)
         return reply.code(400).send({ error: 'Complete the required post fields to preview' });
-    const transcript = input.data.incidentId && ['Admin', 'Reviewer'].includes(request.user.role)
-        ? (await query('SELECT transcript FROM incidents WHERE id=$1', [input.data.incidentId])).rows[0]?.transcript ?? ''
-        : '';
-    const publicData = sanitizePublicPost(input.data.publicData, transcript);
+    const source = input.data.incidentId && ['Admin', 'Reviewer'].includes(request.user.role)
+        ? (await query('SELECT transcript,event_type FROM incidents WHERE id=$1', [input.data.incidentId])).rows[0]
+        : undefined;
+    const publicData = sanitizePublicPost(input.data.publicData, source?.transcript ?? '', { applyPrivacyFilters: source?.event_type !== 'manual' });
     return { publicData, renderedPost: renderOfficialPost(publicData) };
 });
 app.post('/api/auth/login', { config: { rateLimit: { max: 8, timeWindow: '1 minute' } } }, async (request, reply) => {
@@ -385,7 +382,7 @@ app.post('/api/incidents', { preHandler: [requireRoles('Admin', 'Reviewer')] }, 
     const talkgroup = await query('SELECT id FROM talkgroups WHERE id=$1 AND enabled=true', [input.data.talkgroupId]);
     if (!talkgroup.rowCount)
         return reply.code(400).send({ error: 'Select a configured talkgroup' });
-    const safe = sanitizePublicPost(input.data.publicData);
+    const safe = sanitizePublicPost(input.data.publicData, '', { applyPrivacyFilters: false });
     safe.suggestedImage = null;
     const id = randomUUID();
     await query(`INSERT INTO incidents(id,talkgroup_id,event_type,status,public_data,audio_token_hash,created_by)
@@ -395,14 +392,14 @@ app.post('/api/incidents', { preHandler: [requireRoles('Admin', 'Reviewer')] }, 
 });
 app.post('/api/incidents/:id/audio', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
     const { id } = request.params;
-    const incident = await query('SELECT id FROM incidents WHERE id=$1', [id]);
-    if (!incident.rowCount)
-        return reply.code(404).send({ error: 'Incident not found' });
     try {
+        const incident = await query('SELECT id FROM incidents WHERE id=$1', [id]);
+        if (!incident.rowCount)
+            return reply.code(404).send({ error: 'Incident not found' });
         const part = await request.file();
         const path = await saveUpload(part, id, 'original');
-        await query("UPDATE incidents SET original_path=$2,status='processing',updated_at=now() WHERE id=$1", [id, path]);
-        await query("UPDATE incidents SET source_metadata=source_metadata || $2::jsonb WHERE id=$1", [id, { audioSources: [path] }]);
+        await query(`UPDATE incidents SET original_path=$2,status='processing',
+      source_metadata=coalesce(source_metadata,'{}'::jsonb) || $3::jsonb,updated_at=now() WHERE id=$1`, [id, path, { audioSources: [path] }]);
         try {
             await enqueueJob('process', { type: 'process', incidentId: id }, { jobId: `process-${id}-${Date.now()}` });
         }
@@ -413,7 +410,10 @@ app.post('/api/incidents/:id/audio', { preHandler: [requireRoles('Admin', 'Revie
         return reply.code(202).send({ queued: true });
     }
     catch (error) {
-        return reply.code(400).send({ error: error instanceof Error ? error.message : 'Upload failed' });
+        request.log.error({ incidentId: id, err: error }, 'Manual audio upload failed');
+        const statusCode = error && typeof error === 'object' && 'statusCode' in error && typeof error.statusCode === 'number' ? error.statusCode : 500;
+        const clientError = statusCode >= 400 && statusCode < 500;
+        return reply.code(clientError ? statusCode : 500).send({ error: clientError && error instanceof Error ? error.message : 'Audio upload failed' });
     }
 });
 app.post('/api/incidents/:id/reprocess', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
@@ -490,10 +490,10 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
     const input = z.object({ publicData: publicPostSchema, imageId: z.string().uuid().nullable() }).safeParse(request.body);
     if (!input.success)
         return reply.code(400).send({ error: 'Invalid post fields', details: input.error.flatten() });
-    const source = await query('SELECT transcript FROM incidents WHERE id=$1', [id]);
+    const source = await query('SELECT transcript,event_type FROM incidents WHERE id=$1', [id]);
     if (!source.rowCount)
         return reply.code(404).send({ error: 'Incident not found' });
-    const safe = sanitizePublicPost(input.data.publicData, source.rows[0].transcript ?? '');
+    const safe = sanitizePublicPost(input.data.publicData, source.rows[0].transcript ?? '', { applyPrivacyFilters: source.rows[0].event_type !== 'manual' });
     if (input.data.imageId) {
         const image = await query('SELECT id FROM images WHERE id=$1 AND enabled=true', [input.data.imageId]);
         if (!image.rowCount)
@@ -504,9 +504,9 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
     else
         safe.suggestedImage = null;
     const updated = await query(`UPDATE incidents SET public_data=$2,image_id=$3,status='draft',publish_error=NULL,updated_at=now()
-    WHERE id=$1 AND status NOT IN ('publish_queued','published','publish_unknown') RETURNING id`, [id, safe, input.data.imageId]);
+    WHERE id=$1 AND status NOT IN ('processing','publish_queued','published','publish_unknown') RETURNING id`, [id, safe, input.data.imageId]);
     if (!updated.rowCount)
-        return reply.code(409).send({ error: 'Incident cannot be edited in its current state' });
+        return reply.code(409).send({ error: 'Incident cannot be edited while audio is processing or in its current state' });
     await audit(request.user.sub, 'post.edited', id, { publicData: safe, imageId: input.data.imageId });
     return { saved: true, publicData: safe };
 });
@@ -514,7 +514,7 @@ app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Rev
     const { id } = request.params;
     const result = await transaction(async (tx) => {
         const incident = await tx.query('SELECT public_data,status,image_id,playable_path,event_type,transcript FROM incidents WHERE id=$1 FOR UPDATE', [id]);
-        if (!incident.rowCount || ['published', 'publish_queued', 'rejected', 'publish_unknown'].includes(incident.rows[0].status)) {
+        if (!incident.rowCount || ['processing', 'published', 'publish_queued', 'rejected', 'publish_unknown'].includes(incident.rows[0].status)) {
             return { status: 409, body: { error: 'Incident cannot be approved in its current state' } };
         }
         if (!incident.rows[0].playable_path && incident.rows[0].event_type !== 'manual') {
@@ -525,7 +525,7 @@ app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Rev
             if (!image.rowCount)
                 return { status: 409, body: { error: 'Selected image is no longer enabled' } };
         }
-        const safe = sanitizePublicPost(incident.rows[0].public_data, incident.rows[0].transcript ?? '');
+        const safe = sanitizePublicPost(incident.rows[0].public_data, incident.rows[0].transcript ?? '', { applyPrivacyFilters: incident.rows[0].event_type !== 'manual' });
         await tx.query("UPDATE incidents SET public_data=$2,status='approved',updated_at=now() WHERE id=$1", [id, safe]);
         await tx.query('INSERT INTO approvals(incident_id,user_id,public_snapshot) VALUES ($1,$2,$3)', [id, request.user.sub, safe]);
         await tx.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'post.approved\',$2,$3)', [request.user.sub, id, { publicData: safe }]);

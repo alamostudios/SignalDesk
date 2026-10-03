@@ -121,10 +121,10 @@ app.get('/api/health', async (_request, reply) => {
 app.post('/api/post-preview', { preHandler: [requireRoles(...roles)] }, async (request, reply) => {
   const input = z.object({ incidentId: z.string().uuid().optional(), publicData: publicPostSchema }).strict().safeParse(request.body);
   if (!input.success) return reply.code(400).send({ error: 'Complete the required post fields to preview' });
-  const transcript = input.data.incidentId && ['Admin','Reviewer'].includes(request.user.role)
-    ? (await query<{ transcript: string|null }>('SELECT transcript FROM incidents WHERE id=$1', [input.data.incidentId])).rows[0]?.transcript ?? ''
-    : '';
-  const publicData = sanitizePublicPost(input.data.publicData, transcript);
+  const source = input.data.incidentId && ['Admin','Reviewer'].includes(request.user.role)
+    ? (await query<{ transcript: string|null; event_type: string }>('SELECT transcript,event_type FROM incidents WHERE id=$1', [input.data.incidentId])).rows[0]
+    : undefined;
+  const publicData = sanitizePublicPost(input.data.publicData, source?.transcript ?? '', { applyPrivacyFilters: source?.event_type !== 'manual' });
   return { publicData, renderedPost: renderOfficialPost(publicData) };
 });
 
@@ -358,7 +358,7 @@ app.post('/api/incidents', { preHandler: [requireRoles('Admin', 'Reviewer')] }, 
   if (!input.success) return reply.code(400).send({ error: 'Invalid manual post', details: input.error.flatten() });
   const talkgroup = await query('SELECT id FROM talkgroups WHERE id=$1 AND enabled=true', [input.data.talkgroupId]);
   if (!talkgroup.rowCount) return reply.code(400).send({ error: 'Select a configured talkgroup' });
-  const safe = sanitizePublicPost(input.data.publicData);
+  const safe = sanitizePublicPost(input.data.publicData, '', { applyPrivacyFilters: false });
   safe.suggestedImage = null;
   const id = randomUUID();
   await query(`INSERT INTO incidents(id,talkgroup_id,event_type,status,public_data,audio_token_hash,created_by)
@@ -449,9 +449,9 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
   const { id } = request.params as { id: string };
   const input = z.object({ publicData: publicPostSchema, imageId: z.string().uuid().nullable() }).safeParse(request.body);
   if (!input.success) return reply.code(400).send({ error: 'Invalid post fields', details: input.error.flatten() });
-  const source = await query<{ transcript: string|null }>('SELECT transcript FROM incidents WHERE id=$1', [id]);
+  const source = await query<{ transcript: string|null; event_type: string }>('SELECT transcript,event_type FROM incidents WHERE id=$1', [id]);
   if (!source.rowCount) return reply.code(404).send({ error: 'Incident not found' });
-  const safe = sanitizePublicPost(input.data.publicData, source.rows[0].transcript ?? '');
+  const safe = sanitizePublicPost(input.data.publicData, source.rows[0].transcript ?? '', { applyPrivacyFilters: source.rows[0].event_type !== 'manual' });
   if (input.data.imageId) {
     const image = await query('SELECT id FROM images WHERE id=$1 AND enabled=true', [input.data.imageId]);
     if (!image.rowCount) return reply.code(400).send({ error: 'Image is not in the configured image bank' });
@@ -479,7 +479,7 @@ app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Rev
       const image = await tx.query('SELECT id FROM images WHERE id=$1 AND enabled=true', [incident.rows[0].image_id]);
       if (!image.rowCount) return { status: 409, body: { error: 'Selected image is no longer enabled' } };
     }
-    const safe = sanitizePublicPost(incident.rows[0].public_data, incident.rows[0].transcript ?? '');
+    const safe = sanitizePublicPost(incident.rows[0].public_data, incident.rows[0].transcript ?? '', { applyPrivacyFilters: incident.rows[0].event_type !== 'manual' });
     await tx.query("UPDATE incidents SET public_data=$2,status='approved',updated_at=now() WHERE id=$1", [id, safe]);
     await tx.query('INSERT INTO approvals(incident_id,user_id,public_snapshot) VALUES ($1,$2,$3)', [id, request.user.sub, safe]);
     await tx.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'post.approved\',$2,$3)', [request.user.sub, id, { publicData: safe }]);

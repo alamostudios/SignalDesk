@@ -5,8 +5,10 @@ const streetAddressPattern = /\b\d{1,6}\s+(?:[\w.'-]+\s+){0,4}(?:street|st\.?|ro
 const emailPattern = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const probableNamePattern = /\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b/g;
 const jurisdictionMarkerPattern = /^(.+\b(?:county|parish|city|township|town|village|borough|state|district)\b)(.*)$/i;
-export function sanitizePublicPost(value, contextText = '') {
+export function sanitizePublicPost(value, contextText = '', options = {}) {
     const candidate = publicPostSchema.parse(value);
+    if (options.applyPrivacyFilters === false)
+        return candidate;
     if (blockedSensitivity.test(`${candidate.call} ${candidate.extraInfo} ${contextText}`)) {
         candidate.sensitivity = 'high';
         candidate.call = 'Sensitive incident';
@@ -14,8 +16,10 @@ export function sanitizePublicPost(value, contextText = '') {
         candidate.location = generalizeAddress(candidate.location);
     }
     const jurisdictionText = cleanText(candidate.jurisdiction);
-    candidate.jurisdiction = sanitizeJurisdiction(jurisdictionText);
+    candidate.jurisdiction = sanitizeJurisdiction(jurisdictionText) || 'Jurisdiction withheld';
     candidate.call = generalizeAddress(redactLikelyNames(cleanText(candidate.call)));
+    if (!candidate.call)
+        candidate.call = candidate.sensitivity === 'high' ? 'Sensitive incident' : 'Details withheld';
     candidate.location = generalizeAddress(redactLikelyNames(cleanText(candidate.location)));
     candidate.extraInfo = generalizeAddress(redactLikelyNames(cleanText(candidate.extraInfo)));
     candidate.timeReceived = cleanText(candidate.timeReceived);

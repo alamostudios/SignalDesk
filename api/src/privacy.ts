@@ -16,8 +16,9 @@ export function sanitizePublicPost(value: unknown, contextText = ''): PublicPost
     candidate.location = generalizeAddress(candidate.location);
   }
   const jurisdictionText = cleanText(candidate.jurisdiction);
-  candidate.jurisdiction = sanitizeJurisdiction(jurisdictionText);
+  candidate.jurisdiction = sanitizeJurisdiction(jurisdictionText) || 'Jurisdiction withheld';
   candidate.call = generalizeAddress(redactLikelyNames(cleanText(candidate.call)));
+  if (!candidate.call) candidate.call = candidate.sensitivity === 'high' ? 'Sensitive incident' : 'Details withheld';
   candidate.location = generalizeAddress(redactLikelyNames(cleanText(candidate.location)));
   candidate.extraInfo = generalizeAddress(redactLikelyNames(cleanText(candidate.extraInfo)));
   candidate.timeReceived = cleanText(candidate.timeReceived);

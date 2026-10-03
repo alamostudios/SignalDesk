@@ -211,6 +211,18 @@ export default function App() {
     await perform(`/incidents/${detail.id}`, 'PATCH', { publicData: postDraft, imageId: imageId || null }, 'Draft saved. Approval was cleared until the revised post is approved.');
   }
 
+  async function approvePost() {
+    if (!detail) return;
+    setBusy(true); setNotice('');
+    try {
+      await request(`/incidents/${detail.id}`, token, { method: 'PATCH', body: JSON.stringify({ publicData: postDraft, imageId: imageId || null }) });
+      await request(`/incidents/${detail.id}/approve`, token, { method: 'POST', body: JSON.stringify({}) });
+      await Promise.all([loadQueue(), loadDetails(detail.id)]);
+      setNotice('Draft saved and approved. Publishing remains a separate action.');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not save and approve draft'); }
+    finally { setBusy(false); }
+  }
+
   async function resolvePublication(postId?: string) {
     if (!detail) return;
     if (!postId && !window.confirm('Confirm that you checked the Facebook Page and this incident was not published? This unlocks a retry.')) return;
@@ -366,7 +378,7 @@ export default function App() {
                     <label className="span-two">Configured location image<select value={imageId} onChange={e=>setImageId(e.target.value)}><option value="">No image</option>{images.filter(image=>image.enabled).map(image=><option key={image.id} value={image.id}>{image.name} · {image.location}</option>)}</select></label>
                   </div></fieldset>
                   <div className="post-preview"><div className="preview-label"><span>PUBLIC PREVIEW</span><span>FACEBOOK</span></div><pre>{postPreview}</pre>{imagePreview && <img className="preview-image" src={imagePreview} alt={`Selected image: ${images.find(image=>image.id===imageId)?.name ?? ''}`}/ >}{detail.publicAudioUrl && <a href={detail.publicAudioUrl} className="audio-public-link">Public audio link <ChevronRight size={14}/></a>}</div>
-                  {canReview && <div className="review-actions"><button className="secondary" disabled={busy || ['published','publish_queued','publish_unknown'].includes(detail.status)} onClick={savePost}>Save draft</button><button className="reject-button" disabled={busy || ['published','publish_queued','publish_unknown','rejected'].includes(detail.status)} onClick={()=>perform(`/incidents/${detail.id}/reject`,'POST',{reason:''},'Incident rejected')}>Reject</button>{detail.status==='approved'||detail.status==='publish_failed' ? <button className="primary" disabled={busy} onClick={()=>perform(`/incidents/${detail.id}/publish`,'POST',{},'Publication queued')}>{detail.status==='publish_failed'?'Retry Facebook':'Publish to Facebook'}<ChevronRight size={16}/></button> : <button className="approve-button" disabled={busy || !postDraft.jurisdiction.trim() || !postDraft.call.trim() || (detail.event_type !== 'manual' && !detail.audioUrl) || ['published','publish_queued','publish_unknown','rejected'].includes(detail.status)} onClick={()=>perform(`/incidents/${detail.id}/approve`,'POST',{},'Human approval recorded. Publishing remains a separate action.')}>Approve draft<Check size={16}/></button>}</div>}
+                  {canReview && <div className="review-actions"><button className="secondary" disabled={busy || ['published','publish_queued','publish_unknown'].includes(detail.status)} onClick={savePost}>Save draft</button><button className="reject-button" disabled={busy || ['published','publish_queued','publish_unknown','rejected'].includes(detail.status)} onClick={()=>perform(`/incidents/${detail.id}/reject`,'POST',{reason:''},'Incident rejected')}>Reject</button>{detail.status==='approved'||detail.status==='publish_failed' ? <button className="primary" disabled={busy} onClick={()=>perform(`/incidents/${detail.id}/publish`,'POST',{},'Publication queued')}>{detail.status==='publish_failed'?'Retry Facebook':'Publish to Facebook'}<ChevronRight size={16}/></button> : <button className="approve-button" disabled={busy || !postDraft.jurisdiction.trim() || !postDraft.call.trim() || (detail.event_type !== 'manual' && !detail.audioUrl) || ['published','publish_queued','publish_unknown','rejected'].includes(detail.status)} onClick={approvePost}>Approve draft<Check size={16}/></button>}</div>}
                 </section>
                 {canReview && <section className="detail-section"><details><summary>Internal review data</summary><div className="internal-grid"><div><h4>Transcript</h4><p className="transcript-text">{detail.transcript || 'No transcript available.'}</p></div><div><h4>Private extraction</h4><pre>{JSON.stringify(detail.internal_data ?? {}, null, 2)}</pre></div></div></details></section>}
                 <section className="detail-section"><details><summary>Audit history <span className="count-badge">{detail.audit?.length ?? 0}</span></summary><div className="audit-list">{detail.audit?.map((entry,index)=><div key={`${entry.created_at}-${index}`}><strong>{entry.action}</strong><time>{new Date(entry.created_at).toLocaleString()}</time><small>{entry.email ?? 'System'}</small><pre>{JSON.stringify(entry.details, null, 2)}</pre></div>)}</div></details></section>

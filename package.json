@@ -9,8 +9,7 @@
   "scripts": {
     "build": "npm run build --workspace api && npm run build --workspace web",
     "test": "npm test --workspace api",
-    "dev": "concurrently -k -n api,worker,web -c blue,magenta,green \"npm run dev --workspace api\" \"npm run worker:dev --workspace api\" \"npm run dev --workspace web\"",
-    "db:migrate": "npm run db:migrate --workspace api"
+    "dev": "concurrently -k -n app,web -c blue,green \"npm run dev --workspace api\" \"npm run dev --workspace web\""
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

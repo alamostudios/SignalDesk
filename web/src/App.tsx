@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import { Activity, AudioLines, Check, ChevronRight, CircleAlert, Clock3, FilePlus2, History, ImagePlus, LogOut, Radio, Search, Settings2, ShieldCheck, SlidersHorizontal, Upload, X } from 'lucide-react';
 
-type Role = 'Admin' | 'Reviewer' | 'Viewer';
-type User = { id: string; email: string; role: Role };
+type User = { id: string; email: string; role: 'Admin' };
 type PublicPost = { jurisdiction: string; call: string; location: string; extraInfo: string; timeReceived: string; sensitivity: 'low'|'moderate'|'high'; suggestedImage: string|null };
 type Summary = { id: string; talkgroup_id: string; talkgroup_label: string; event_type: string; status: string; received_at: string; public_data: PublicPost; image_id: string|null; image_name: string|null; facebook_post_id?: string; publish_error?: string };
 type Detail = Summary & { transcript: string|null; internal_data: Record<string, unknown>|null; original_path?: string|null; source_metadata?: Record<string, unknown>; audioUrl: string|null; originalUrl: string|null; publicAudioUrl: string|null; renderedPost: string; approvals: { created_at: string; email: string }[]; audit: { action: string; details: Record<string, unknown>; created_at: string; email: string|null }[] };
@@ -54,7 +53,6 @@ export default function App() {
   const [newTalkgroup, setNewTalkgroup] = useState({ id: '', label: '' });
   const [newRadioKey, setNewRadioKey] = useState({ name: '', systemId: '', talkgroupIds: [] as string[] });
   const [createdRadioKey, setCreatedRadioKey] = useState('');
-  const [newUser, setNewUser] = useState({ email: '', password: '', role: 'Reviewer' as Role });
   const [reconcilePostId, setReconcilePostId] = useState('');
   const modalRef = useRef<HTMLElement|null>(null);
   const manualButtonRef = useRef<HTMLButtonElement|null>(null);
@@ -286,12 +284,6 @@ export default function App() {
     catch (error) { setNotice(error instanceof Error ? error.message : 'Image not updated'); }
   }
 
-  async function addUser(event: FormEvent) {
-    event.preventDefault();
-    try { await request('/users', token, { method: 'POST', body: JSON.stringify(newUser) }); setNewUser({ email:'',password:'',role:'Reviewer' }); setNotice('Account created'); }
-    catch (error) { setNotice(error instanceof Error ? error.message : 'Account not created'); }
-  }
-
   async function addImage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -342,9 +334,6 @@ export default function App() {
           <section className="settings-section"><div className="section-heading"><div><h2>Location image bank</h2><p>Only these configured images can be attached to a post.</p></div></div>
             <form className="inline-form image-form" onSubmit={addImage}><label>Image file<input type="file" name="file" accept="image/png,image/jpeg,image/webp" required/></label><label>Image name<input name="name" placeholder="Fulton.png" required/></label><label>Location<input name="location" placeholder="Fulton County" required/></label><button className="secondary"><ImagePlus size={16}/>Add image</button></form>
             <div className="image-bank">{images.map(image=><div className="image-bank-item" key={image.id}><div className="image-swatch"><ImagePlus size={18}/></div><div><strong>{image.name}</strong><small>{image.location}</small></div><button className="table-action" onClick={()=>toggleImage(image)}>{image.enabled?'Disable':'Enable'}</button></div>)}</div>
-          </section>
-          <section className="settings-section"><div className="section-heading"><div><h2>Workspace accounts</h2><p>Grant the minimum role needed for each user.</p></div></div>
-            <form className="inline-form" onSubmit={addUser}><label>Email address<input type="email" required value={newUser.email} onChange={e=>setNewUser({...newUser,email:e.target.value})}/></label><label>Temporary password<input type="password" minLength={16} required value={newUser.password} onChange={e=>setNewUser({...newUser,password:e.target.value})}/></label><label>Role<select value={newUser.role} onChange={e=>setNewUser({...newUser,role:e.target.value as Role})}><option>Viewer</option><option>Reviewer</option><option>Admin</option></select></label><button className="primary"><Check size={16}/>Create account</button></form>
           </section>
           <p className="settings-note"><SlidersHorizontal size={16}/> Tone frequencies, correlation window, AI provider, and Facebook credentials are managed in the deployment environment.</p>
         </section> : tab === 'audit' ? <AuditPanel token={token}/> : <>

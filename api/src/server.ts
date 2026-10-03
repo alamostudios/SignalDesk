@@ -1,19 +1,23 @@
 import './env.js';
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
-import cors from '@fastify/cors';
+import fastifyStatic from '@fastify/static';
 import jwt from '@fastify/jwt';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 import bcrypt from 'bcryptjs';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { extname } from 'node:path';
+import { extname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { audit, pool, query } from './db.js';
-import { queue, redis } from './queue.js';
+import { audit, closeDatabase, query, transaction } from './db.js';
+import { enqueueJob, workerOnline } from './queue.js';
 import { publicPostSchema, renderOfficialPost, type UserClaims, type UserRole } from './types.js';
 import { sanitizePublicPost } from './privacy.js';
 import { storage } from './storage.js';
 import { radioSource } from './radio.js';
+import { runMigrations } from './migrate.js';
+import { startWorker, stopWorker } from './worker.js';
 
 declare module '@fastify/jwt' {
   interface FastifyJWT { payload: UserClaims; user: UserClaims }
@@ -26,7 +30,6 @@ const publicAudioToken = (incidentId: string) => createHmac('sha256', process.en
 
 app.addContentTypeParser(['audio/mpeg','application/octet-stream'], { parseAs: 'buffer', bodyLimit: 64 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
-await app.register(cors, { origin: process.env.CORS_ORIGIN?.split(',') ?? false });
 await app.register(jwt, { secret: process.env.JWT_SECRET ?? 'development-only-change-this-secret-now', sign: { expiresIn: '8h' } });
 await app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024, files: 1, fieldSize: 64 * 1024, fieldNameSize: 100 } });
 await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
@@ -42,16 +45,6 @@ function constantTimeSecret(received: string | undefined, expected: string | und
   const left = Buffer.from(received);
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
-}
-
-async function enqueueJob(name: string, data: { type: 'process' | 'publish'; incidentId: string }, options: { jobId: string; attempts?: number }) {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      queue.add(name, data, options),
-      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Queue enqueue timed out')), 3000); })
-    ]);
-  } finally { if (timer) clearTimeout(timer); }
 }
 
 async function readMultipart(request: FastifyRequest) {
@@ -108,11 +101,10 @@ async function bootstrapAdmin() {
   const productionInvalid = process.env.NODE_ENV === 'production' && (
     !email || !password || password.length < 16 || password.includes('change-this') ||
     !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.includes('replace-with') ||
-    !process.env.INGEST_API_KEY || process.env.INGEST_API_KEY.length < 32 || process.env.INGEST_API_KEY.includes('replace-with') ||
     !process.env.PUBLIC_AUDIO_SECRET || process.env.PUBLIC_AUDIO_SECRET.length < 32 || process.env.PUBLIC_AUDIO_SECRET.includes('replace-with') ||
-    !process.env.PUBLIC_BASE_URL?.startsWith('https://') || !process.env.WHISPER_BASE_URL || !process.env.AI_BASE_URL
+    !process.env.PUBLIC_BASE_URL?.startsWith('https://')
   );
-  if (productionInvalid) throw new Error('Production requires unique admin credentials, 32+ character JWT/ingestion/audio secrets, HTTPS PUBLIC_BASE_URL, and local AI provider endpoints');
+  if (productionInvalid) throw new Error('Production requires a unique admin password, 32+ character JWT/audio secrets, and HTTPS PUBLIC_BASE_URL');
   if (!email || !password || password.length < 16 || !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
     return;
   }
@@ -125,11 +117,8 @@ async function bootstrapAdmin() {
 
 app.get('/api/health', async (_request, reply) => {
   try {
-    await pool.query('SELECT 1');
-    if (redis.status !== 'ready') throw new Error('Queue unavailable');
-    await redis.ping();
-    const heartbeat = await redis.get('rdio:worker:heartbeat');
-    return { status: 'ok', workerOnline: heartbeat !== null && Date.now() - Number(heartbeat) < 35_000 };
+    await query('SELECT 1');
+    return { status: 'ok', workerOnline };
   } catch {
     return reply.code(503).send({ status: 'unavailable', workerOnline: false });
   }
@@ -306,17 +295,17 @@ app.put('/api/radio-upload/:sessionId', async (request, reply) => {
   if (!z.string().uuid().safeParse(sessionId).success || !Buffer.isBuffer(request.body) || request.body.length < 100 || request.body.length > 64 * 1024 * 1024) {
     return reply.code(400).type('text/plain').send('Invalid audio upload');
   }
-  const client = await pool.connect();
+  let upload: Record<string, any> | null;
   try {
-    await client.query('BEGIN');
-    const session = await client.query(`SELECT s.*,k.enabled AS key_enabled FROM radio_upload_sessions s
-      JOIN radio_api_keys k ON k.id=s.radio_key_id WHERE s.id=$1 FOR UPDATE OF s`, [sessionId]);
-    const upload = session.rows[0];
-    if (!upload || !upload.key_enabled || upload.status !== 'pending' || new Date(upload.expires_at).getTime() < Date.now()) {
-      await client.query('ROLLBACK'); return reply.code(404).type('text/plain').send('Upload session expired');
-    }
-    await client.query("UPDATE radio_upload_sessions SET status='uploading' WHERE id=$1", [sessionId]);
-    await client.query('COMMIT');
+    upload = await transaction(async tx => {
+      const session = await tx.query(`SELECT s.*,k.enabled AS key_enabled FROM radio_upload_sessions s
+        JOIN radio_api_keys k ON k.id=s.radio_key_id WHERE s.id=$1 FOR UPDATE OF s`, [sessionId]);
+      const row = session.rows[0];
+      if (!row || !row.key_enabled || row.status !== 'pending' || new Date(row.expires_at).getTime() < Date.now()) return null;
+      await tx.query("UPDATE radio_upload_sessions SET status='uploading' WHERE id=$1", [sessionId]);
+      return row;
+    });
+    if (!upload) return reply.code(404).type('text/plain').send('Upload session expired');
     const stored = await storeInboundRadioCall({
       systemId: upload.system_id, talkgroupId: upload.talkgroup_id, receivedAt: new Date(upload.received_at),
       externalId: upload.external_id, audio: request.body, audioMime: 'audio/mpeg', metadata: upload.metadata, keyId: upload.radio_key_id
@@ -324,11 +313,10 @@ app.put('/api/radio-upload/:sessionId', async (request, reply) => {
     await query("UPDATE radio_upload_sessions SET status='complete' WHERE id=$1", [sessionId]);
     return reply.type('text/plain').send(stored.duplicate ? '200' : '200');
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
     await query("UPDATE radio_upload_sessions SET status='failed' WHERE id=$1 AND status='uploading'", [sessionId]).catch(() => undefined);
     request.log.error({ error, sessionId }, 'SDRTrunk audio upload failed');
     return reply.code(500).type('text/plain').send('Audio upload failed');
-  } finally { client.release(); }
+  }
 });
 
 app.get('/api/incidents', { preHandler: [requireRoles(...roles)] }, async (request, reply) => {
@@ -480,28 +468,25 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
 
 app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const incident = await client.query('SELECT public_data,status,image_id,playable_path,event_type,transcript FROM incidents WHERE id=$1 FOR UPDATE', [id]);
+  const result = await transaction(async tx => {
+    const incident = await tx.query('SELECT public_data,status,image_id,playable_path,event_type,transcript FROM incidents WHERE id=$1 FOR UPDATE', [id]);
     if (!incident.rowCount || ['published','publish_queued','rejected','publish_unknown'].includes(incident.rows[0].status)) {
-      await client.query('ROLLBACK'); return reply.code(409).send({ error: 'Incident cannot be approved in its current state' });
+      return { status: 409, body: { error: 'Incident cannot be approved in its current state' } };
     }
     if (!incident.rows[0].playable_path && incident.rows[0].event_type !== 'manual') {
-      await client.query('ROLLBACK'); return reply.code(409).send({ error: 'A processed, browser-playable recording is required before approval' });
+      return { status: 409, body: { error: 'A processed, browser-playable recording is required before approval' } };
     }
     if (incident.rows[0].image_id) {
-      const image = await client.query('SELECT id FROM images WHERE id=$1 AND enabled=true', [incident.rows[0].image_id]);
-      if (!image.rowCount) { await client.query('ROLLBACK'); return reply.code(409).send({ error: 'Selected image is no longer enabled' }); }
+      const image = await tx.query('SELECT id FROM images WHERE id=$1 AND enabled=true', [incident.rows[0].image_id]);
+      if (!image.rowCount) return { status: 409, body: { error: 'Selected image is no longer enabled' } };
     }
     const safe = sanitizePublicPost(incident.rows[0].public_data, incident.rows[0].transcript ?? '');
-    await client.query("UPDATE incidents SET public_data=$2,status='approved',updated_at=now() WHERE id=$1", [id, safe]);
-    await client.query('INSERT INTO approvals(incident_id,user_id,public_snapshot) VALUES ($1,$2,$3)', [id, request.user.sub, safe]);
-    await client.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'post.approved\',$2,$3)', [request.user.sub, id, { publicData: safe }]);
-    await client.query('COMMIT');
-    return { approved: true };
-  } catch (error) { await client.query('ROLLBACK'); throw error; }
-  finally { client.release(); }
+    await tx.query("UPDATE incidents SET public_data=$2,status='approved',updated_at=now() WHERE id=$1", [id, safe]);
+    await tx.query('INSERT INTO approvals(incident_id,user_id,public_snapshot) VALUES ($1,$2,$3)', [id, request.user.sub, safe]);
+    await tx.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'post.approved\',$2,$3)', [request.user.sub, id, { publicData: safe }]);
+    return { status: 200, body: { approved: true } };
+  });
+  return reply.code(result.status).send(result.body);
 });
 
 app.post('/api/incidents/:id/reject', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
@@ -519,52 +504,44 @@ app.post('/api/incidents/:id/resolve-publication', { preHandler: [requireRoles('
   const input = z.object({ facebookPostId: z.string().trim().min(1).max(200).optional(), confirmedNotPublished: z.literal(true).optional() })
     .refine(value => Boolean(value.facebookPostId) !== Boolean(value.confirmedNotPublished)).safeParse(request.body);
   if (!input.success) return reply.code(400).send({ error: 'Provide the Facebook post ID, or explicitly confirm that no post exists' });
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const incident = await client.query("SELECT status FROM incidents WHERE id=$1 FOR UPDATE", [id]);
+  const result = await transaction(async tx => {
+    const incident = await tx.query("SELECT status FROM incidents WHERE id=$1 FOR UPDATE", [id]);
     if (!incident.rowCount || incident.rows[0].status !== 'publish_unknown') {
-      await client.query('ROLLBACK'); return reply.code(409).send({ error: 'Incident is not awaiting publication reconciliation' });
+      return { status: 409, body: { error: 'Incident is not awaiting publication reconciliation' } };
     }
     if (input.data.facebookPostId) {
-      await client.query("UPDATE incidents SET status='published',facebook_post_id=$2,publish_error=NULL,updated_at=now() WHERE id=$1", [id, input.data.facebookPostId]);
-      await client.query("UPDATE publish_jobs SET status='published',facebook_post_id=$2,error=NULL,updated_at=now() WHERE incident_id=$1", [id, input.data.facebookPostId]);
-      await client.query("INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,'publish.reconciled_as_published',$2,$3)", [request.user.sub, id, { facebookPostId: input.data.facebookPostId }]);
+      await tx.query("UPDATE incidents SET status='published',facebook_post_id=$2,publish_error=NULL,updated_at=now() WHERE id=$1", [id, input.data.facebookPostId]);
+      await tx.query("UPDATE publish_jobs SET status='published',facebook_post_id=$2,error=NULL,updated_at=now() WHERE incident_id=$1", [id, input.data.facebookPostId]);
+      await tx.query("INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,'publish.reconciled_as_published',$2,$3)", [request.user.sub, id, { facebookPostId: input.data.facebookPostId }]);
     } else {
-      await client.query("UPDATE incidents SET status='publish_failed',publish_error=NULL,updated_at=now() WHERE id=$1", [id]);
-      await client.query("UPDATE publish_jobs SET status='failed',error='Admin confirmed no Facebook post exists',updated_at=now() WHERE incident_id=$1", [id]);
-      await client.query("INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,'publish.reconciled_as_not_published',$2,'{}')", [request.user.sub, id]);
+      await tx.query("UPDATE incidents SET status='publish_failed',publish_error=NULL,updated_at=now() WHERE id=$1", [id]);
+      await tx.query("UPDATE publish_jobs SET status='failed',error='Admin confirmed no Facebook post exists',updated_at=now() WHERE incident_id=$1", [id]);
+      await tx.query("INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,'publish.reconciled_as_not_published',$2,'{}')", [request.user.sub, id]);
     }
-    await client.query('COMMIT');
-    return { reconciled: true, status: input.data.facebookPostId ? 'published' : 'publish_failed' };
-  } catch (error) { await client.query('ROLLBACK'); throw error; }
-  finally { client.release(); }
+    return { status: 200, body: { reconciled: true, publicationStatus: input.data.facebookPostId ? 'published' : 'publish_failed' } };
+  });
+  return reply.code(result.status).send(result.body);
 });
 
 app.post('/api/incidents/:id/publish', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const incident = await client.query("SELECT status FROM incidents WHERE id=$1 FOR UPDATE", [id]);
+  const result = await transaction(async tx => {
+    const incident = await tx.query("SELECT status FROM incidents WHERE id=$1 FOR UPDATE", [id]);
     if (!incident.rowCount || !['approved','publish_failed'].includes(incident.rows[0].status)) {
-      await client.query('ROLLBACK'); return reply.code(409).send({ error: 'A current human approval is required before publishing' });
+      return { status: 409, body: { error: 'A current human approval is required before publishing' } };
     }
-    const approval = await client.query('SELECT id FROM approvals WHERE incident_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
-    if (!approval.rowCount) { await client.query('ROLLBACK'); return reply.code(403).send({ error: 'Human approval record not found' }); }
-    await client.query("UPDATE incidents SET status='publish_queued',publish_error=NULL,updated_at=now() WHERE id=$1", [id]);
-    await client.query(`INSERT INTO publish_jobs(incident_id,status,attempts) VALUES ($1,'queued',0)
+    const approval = await tx.query('SELECT id FROM approvals WHERE incident_id=$1 ORDER BY created_at DESC LIMIT 1', [id]);
+    if (!approval.rowCount) return { status: 403, body: { error: 'Human approval record not found' } };
+    await tx.query("UPDATE incidents SET status='publish_queued',publish_error=NULL,updated_at=now() WHERE id=$1", [id]);
+    await tx.query(`INSERT INTO publish_jobs(incident_id,status,attempts) VALUES ($1,'queued',0)
       ON CONFLICT (incident_id) DO UPDATE SET status='queued',error=NULL,updated_at=now() WHERE publish_jobs.status <> 'published'`, [id]);
-    await client.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'publish.queued\',$2,\'{}\')', [request.user.sub, id]);
-    await client.query('COMMIT');
-    try { await enqueueJob('publish', { type: 'publish', incidentId: id }, { jobId: `publish-${id}-${Date.now()}`, attempts: 1 }); }
-    catch (error) { app.log.error({ incidentId: id, error }, 'Publication remains queued for worker recovery'); }
-    return reply.code(202).send({ queued: true });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    await query("UPDATE incidents SET status='publish_failed',publish_error='Queue unavailable' WHERE id=$1 AND status='publish_queued'", [id]);
-    throw error;
-  } finally { client.release(); }
+    await tx.query('INSERT INTO audit_log(user_id,action,incident_id,details) VALUES ($1,\'publish.queued\',$2,\'{}\')', [request.user.sub, id]);
+    return { status: 202, body: { queued: true } };
+  });
+  if (result.status !== 202) return reply.code(result.status).send(result.body);
+  try { await enqueueJob('publish', { type: 'publish', incidentId: id }, { jobId: `publish-${id}-${Date.now()}`, attempts: 1 }); }
+  catch (error) { app.log.error({ incidentId: id, error }, 'Publication remains queued in embedded storage for worker pickup'); }
+  return reply.code(202).send(result.body);
 });
 
 app.get('/api/radio-keys', { preHandler: [requireRoles('Admin')] }, async () => ({
@@ -650,19 +627,20 @@ app.get('/api/audit', { preHandler: [requireRoles('Admin')] }, async request => 
   return { entries: (await query('SELECT a.*,u.email FROM audit_log a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT $1', [safeLimit])).rows };
 });
 
-app.post('/api/users', { preHandler: [requireRoles('Admin')] }, async (request, reply) => {
-  const input = z.object({ email: z.string().email().max(254), password: z.string().min(16).max(200), role: z.enum(['Admin','Reviewer','Viewer']) }).safeParse(request.body);
-  if (!input.success) return reply.code(400).send({ error: 'Email, 16+ character password, and role are required' });
-  const result = await query('INSERT INTO users(email,password_hash,role) VALUES ($1,$2,$3) ON CONFLICT (email) DO NOTHING RETURNING id', [input.data.email.toLowerCase(), await bcrypt.hash(input.data.password, 12), input.data.role]);
-  if (!result.rowCount) return reply.code(409).send({ error: 'User already exists' });
-  await audit(request.user.sub, 'user.created', null, { email: input.data.email, role: input.data.role });
-  return reply.code(201).send({ id: result.rows[0]!.id });
-});
-
+await runMigrations();
 await bootstrapAdmin();
+startWorker();
+const webRoot = resolve(fileURLToPath(new URL('../../web/dist', import.meta.url)));
+if (existsSync(webRoot)) {
+  await app.register(fastifyStatic, { root: webRoot, wildcard: false });
+  app.setNotFoundHandler((request, reply) => {
+    if (request.url.startsWith('/api/') || request.url.startsWith('/public/')) return reply.code(404).send({ error: 'Not found' });
+    return reply.sendFile('index.html');
+  });
+}
 const port = Number(process.env.PORT ?? 3000);
 await app.listen({ host: '0.0.0.0', port });
 
 for (const signal of ['SIGINT','SIGTERM'] as const) process.on(signal, async () => {
-  await app.close(); await queue.close(); await redis.quit(); await pool.end(); process.exit(0);
+  stopWorker(); await app.close(); await closeDatabase(); process.exit(0);
 });

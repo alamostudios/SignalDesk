@@ -3,6 +3,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 
 export type MaterializedObject = { path: string; cleanup: () => Promise<void> };
 
@@ -19,7 +20,8 @@ export class LocalStorageAdapter implements StorageAdapter {
   private readonly root: string;
 
   constructor(root = process.env.STORAGE_DIR ?? './storage') {
-    this.root = resolve(root);
+    const projectRoot = fileURLToPath(new URL('../../', import.meta.url));
+    this.root = resolve(projectRoot, root);
   }
 
   async putBuffer(key: string, data: Buffer): Promise<void> {

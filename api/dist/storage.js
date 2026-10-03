@@ -2,10 +2,12 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { chmod, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { fileURLToPath } from 'node:url';
 export class LocalStorageAdapter {
     root;
     constructor(root = process.env.STORAGE_DIR ?? './storage') {
-        this.root = resolve(root);
+        const projectRoot = fileURLToPath(new URL('../../', import.meta.url));
+        this.root = resolve(projectRoot, root);
     }
     async putBuffer(key, data) {
         await this.ensureRoot();

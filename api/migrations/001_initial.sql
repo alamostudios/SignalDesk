@@ -1,4 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), email text UNIQUE NOT NULL,
   password_hash text NOT NULL, role text NOT NULL CHECK (role IN ('Admin','Reviewer','Viewer')),
@@ -61,6 +60,15 @@ CREATE TABLE IF NOT EXISTS radio_upload_sessions (
   expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS radio_upload_sessions_pending_idx ON radio_upload_sessions(status,expires_at);
+CREATE TABLE IF NOT EXISTS background_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), job_key text UNIQUE NOT NULL,
+  job_type text NOT NULL CHECK (job_type IN ('process','publish')),
+  payload jsonb NOT NULL, status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','processing','complete','failed')),
+  attempts integer NOT NULL DEFAULT 0, max_attempts integer NOT NULL DEFAULT 4,
+  run_after timestamptz NOT NULL DEFAULT now(), last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS background_jobs_ready_idx ON background_jobs(status,run_after,created_at);
 CREATE OR REPLACE FUNCTION reject_history_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION 'History records are append-only';

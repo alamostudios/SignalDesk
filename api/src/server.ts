@@ -99,10 +99,13 @@ async function bootstrapAdmin() {
   const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
   const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
   if (!email || !password) throw new Error('Admin credentials could not be initialized');
-  const existing = await query('SELECT id FROM users WHERE lower(email)=lower($1)', [email]);
+  const existing = await query<{ id: string; password_hash: string }>('SELECT id,password_hash FROM users WHERE lower(email)=lower($1)', [email]);
   if (!existing.rowCount) {
     await query('INSERT INTO users(email,password_hash,role) VALUES ($1,$2,\'Admin\')', [email.toLowerCase(), await bcrypt.hash(password, 12)]);
     app.log.info('Bootstrap administrator created');
+  } else if (process.env.BOOTSTRAP_ADMIN_PASSWORD_GENERATED !== 'true' && !(await bcrypt.compare(password, existing.rows[0]!.password_hash))) {
+    await query('UPDATE users SET password_hash=$1 WHERE id=$2', [await bcrypt.hash(password, 12), existing.rows[0]!.id]);
+    app.log.info('Bootstrap administrator password synchronized from configuration');
   }
 }
 
@@ -366,18 +369,23 @@ app.post('/api/incidents', { preHandler: [requireRoles('Admin', 'Reviewer')] }, 
 
 app.post('/api/incidents/:id/audio', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  const incident = await query('SELECT id FROM incidents WHERE id=$1', [id]);
-  if (!incident.rowCount) return reply.code(404).send({ error: 'Incident not found' });
   try {
+    const incident = await query('SELECT id FROM incidents WHERE id=$1', [id]);
+    if (!incident.rowCount) return reply.code(404).send({ error: 'Incident not found' });
     const part = await request.file();
     const path = await saveUpload(part, id, 'original');
-    await query("UPDATE incidents SET original_path=$2,status='processing',updated_at=now() WHERE id=$1", [id, path]);
-    await query("UPDATE incidents SET source_metadata=source_metadata || $2::jsonb WHERE id=$1", [id, { audioSources: [path] }]);
+    await query(`UPDATE incidents SET original_path=$2,status='processing',
+      source_metadata=coalesce(source_metadata,'{}'::jsonb) || $3::jsonb,updated_at=now() WHERE id=$1`, [id, path, { audioSources: [path] }]);
     try { await enqueueJob('process', { type: 'process', incidentId: id }, { jobId: `process-${id}-${Date.now()}` }); }
     catch (error) { app.log.error({ incidentId: id, error }, 'Manual audio stored; worker enqueue will be recovered'); }
     await audit(request.user.sub, 'audio.uploaded', id, { bytes: part?.file.bytesRead ?? 0 });
     return reply.code(202).send({ queued: true });
-  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Upload failed' }); }
+  } catch (error) {
+    request.log.error({ incidentId: id, err: error }, 'Manual audio upload failed');
+    const statusCode = error && typeof error === 'object' && 'statusCode' in error && typeof error.statusCode === 'number' ? error.statusCode : 500;
+    const clientError = statusCode >= 400 && statusCode < 500;
+    return reply.code(clientError ? statusCode : 500).send({ error: clientError && error instanceof Error ? error.message : 'Audio upload failed' });
+  }
 });
 
 app.post('/api/incidents/:id/reprocess', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
@@ -451,8 +459,8 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
     safe.suggestedImage = matchingName;
   } else safe.suggestedImage = null;
   const updated = await query(`UPDATE incidents SET public_data=$2,image_id=$3,status='draft',publish_error=NULL,updated_at=now()
-    WHERE id=$1 AND status NOT IN ('publish_queued','published','publish_unknown') RETURNING id`, [id, safe, input.data.imageId]);
-  if (!updated.rowCount) return reply.code(409).send({ error: 'Incident cannot be edited in its current state' });
+    WHERE id=$1 AND status NOT IN ('processing','publish_queued','published','publish_unknown') RETURNING id`, [id, safe, input.data.imageId]);
+  if (!updated.rowCount) return reply.code(409).send({ error: 'Incident cannot be edited while audio is processing or in its current state' });
   await audit(request.user.sub, 'post.edited', id, { publicData: safe, imageId: input.data.imageId });
   return { saved: true, publicData: safe };
 });
@@ -461,7 +469,7 @@ app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Rev
   const { id } = request.params as { id: string };
   const result = await transaction(async tx => {
     const incident = await tx.query('SELECT public_data,status,image_id,playable_path,event_type,transcript FROM incidents WHERE id=$1 FOR UPDATE', [id]);
-    if (!incident.rowCount || ['published','publish_queued','rejected','publish_unknown'].includes(incident.rows[0].status)) {
+    if (!incident.rowCount || ['processing','published','publish_queued','rejected','publish_unknown'].includes(incident.rows[0].status)) {
       return { status: 409, body: { error: 'Incident cannot be approved in its current state' } };
     }
     if (!incident.rows[0].playable_path && incident.rows[0].event_type !== 'manual') {

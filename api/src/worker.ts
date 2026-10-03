@@ -110,7 +110,14 @@ async function publishIncident(incidentId: string) {
   if (!claimed.rowCount) throw new PublicationClaimedError('Another local job owns this publication');
   const audioToken = createHmac('sha256', process.env.PUBLIC_AUDIO_SECRET ?? process.env.JWT_SECRET ?? 'development-only-audio-secret').update(incident.id).digest('hex').slice(0, 32);
   const audioUrl = current.includeAudio && incident.playable_path && current.sensitivity !== 'high' ? `${(process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '')}/public/audio/${audioToken}` : undefined;
-  const image = incident.image_key ? { name: incident.image_name as string, data: await storage.read(incident.image_key as string) } : undefined;
+  const imageMimeType: 'image/png'|'image/jpeg'|'image/webp'|undefined = incident.image_key?.toLowerCase().endsWith('.png') ? 'image/png'
+    : incident.image_key?.toLowerCase().endsWith('.webp') ? 'image/webp'
+      : incident.image_key ? 'image/jpeg' : undefined;
+  const image = incident.image_key && imageMimeType ? {
+    name: incident.image_name as string,
+    mimeType: imageMimeType,
+    data: await storage.read(incident.image_key as string)
+  } : undefined;
   const postId = await publisher.publish(renderOfficialPost(current), audioUrl, image);
   const journal = await query("UPDATE publish_jobs SET status='remote_created',facebook_post_id=$2,updated_at=now() WHERE incident_id=$1 AND status='publishing' RETURNING incident_id", [incidentId, postId]);
   if (!journal.rowCount) throw new PublicationUncertainError(`Facebook created post ${postId}, but its ID could not be recorded.`);
@@ -133,6 +140,7 @@ async function handleJob(job: WorkJob) {
     await completeJob(job.id);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    console.error({ incidentId: job.payload.incidentId, jobType: job.payload.type, error: message }, 'Background job failed');
     if (job.payload.type === 'process') {
       if (job.attempts >= job.maxAttempts) await query("UPDATE incidents SET status='draft',source_metadata=source_metadata || $2::jsonb,updated_at=now() WHERE id=$1", [job.payload.incidentId, { processingError: message.slice(0, 500) }]);
     } else {

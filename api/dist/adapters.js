@@ -69,7 +69,9 @@ export class MetaGraphPublisher {
         let attachedMedia;
         if (image) {
             const form = new FormData();
-            form.append('source', new Blob([Uint8Array.from(image.data)]), image.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'location-image');
+            const extension = image.mimeType === 'image/png' ? '.png' : image.mimeType === 'image/webp' ? '.webp' : '.jpg';
+            const filename = (image.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 76) || 'location-image') + extension;
+            form.append('source', new Blob([Uint8Array.from(image.data)], { type: image.mimeType }), filename);
             form.append('published', 'false');
             form.append('access_token', token);
             const photoResponse = await fetch(`https://graph.facebook.com/${version}/${encodeURIComponent(pageId)}/photos`, { method: 'POST', body: form, signal: AbortSignal.timeout(30_000) });

@@ -70,3 +70,11 @@ test('preserves an administrative jurisdiction and removes a name appended to it
   assert.equal(result.jurisdiction, 'Fulton County');
   assert.doesNotMatch(JSON.stringify(result), /Jane Doe/);
 });
+
+test('uses safe required-field labels when privacy redaction removes all content', () => {
+  const result = sanitizePublicPost({ ...sample, jurisdiction: 'Jane Doe', call: 'John Smith' });
+  assert.equal(result.jurisdiction, 'Jurisdiction withheld');
+  assert.equal(result.call, 'Details withheld');
+  assert.equal(publicPostSchema.safeParse(result).success, true);
+  assert.doesNotMatch(JSON.stringify(result), /Jane Doe|John Smith/);
+});

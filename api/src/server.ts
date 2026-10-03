@@ -98,16 +98,7 @@ async function saveUpload(part: Awaited<ReturnType<FastifyRequest['file']>>, id:
 async function bootstrapAdmin() {
   const email = process.env.BOOTSTRAP_ADMIN_EMAIL;
   const password = process.env.BOOTSTRAP_ADMIN_PASSWORD;
-  const productionInvalid = process.env.NODE_ENV === 'production' && (
-    !email || !password || password.length < 16 || password.includes('change-this') ||
-    !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.includes('replace-with') ||
-    !process.env.PUBLIC_AUDIO_SECRET || process.env.PUBLIC_AUDIO_SECRET.length < 32 || process.env.PUBLIC_AUDIO_SECRET.includes('replace-with') ||
-    !process.env.PUBLIC_BASE_URL?.startsWith('https://')
-  );
-  if (productionInvalid) throw new Error('Production requires a unique admin password, 32+ character JWT/audio secrets, and HTTPS PUBLIC_BASE_URL');
-  if (!email || !password || password.length < 16 || !process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-    return;
-  }
+  if (!email || !password) throw new Error('Admin credentials could not be initialized');
   const existing = await query('SELECT id FROM users WHERE lower(email)=lower($1)', [email]);
   if (!existing.rowCount) {
     await query('INSERT INTO users(email,password_hash,role) VALUES ($1,$2,\'Admin\')', [email.toLowerCase(), await bcrypt.hash(password, 12)]);

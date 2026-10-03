@@ -122,7 +122,7 @@ async function publishIncident(incidentId) {
     if (!claimed.rowCount)
         throw new PublicationClaimedError('Another local job owns this publication');
     const audioToken = createHmac('sha256', process.env.PUBLIC_AUDIO_SECRET ?? process.env.JWT_SECRET ?? 'development-only-audio-secret').update(incident.id).digest('hex').slice(0, 32);
-    const audioUrl = incident.playable_path && current.sensitivity !== 'high' ? `${(process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '')}/public/audio/${audioToken}` : undefined;
+    const audioUrl = current.includeAudio && incident.playable_path && current.sensitivity !== 'high' ? `${(process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '')}/public/audio/${audioToken}` : undefined;
     const image = incident.image_key ? { name: incident.image_name, data: await storage.read(incident.image_key) } : undefined;
     const postId = await publisher.publish(renderOfficialPost(current), audioUrl, image);
     const journal = await query("UPDATE publish_jobs SET status='remote_created',facebook_post_id=$2,updated_at=now() WHERE incident_id=$1 AND status='publishing' RETURNING incident_id", [incidentId, postId]);

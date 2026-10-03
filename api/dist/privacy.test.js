@@ -5,7 +5,7 @@ import { hasMatchingApproval, publicPostSchema, renderOfficialPost } from './typ
 import { detectConfiguredTones } from './tones.js';
 const sample = {
     jurisdiction: 'Fulton County', call: '10-50 Rollover', location: '123 Main Street',
-    extraInfo: '', timeReceived: '05:27 hrs', sensitivity: 'low', suggestedImage: null
+    extraInfo: '', timeReceived: '05:27 hrs', includeAudio: true, sensitivity: 'low', suggestedImage: null
 };
 test('generalizes exact street addresses', () => {
     assert.equal(generalizeAddress('123 Main Street'), '1200 block of Main Street');
@@ -78,4 +78,11 @@ test('manual posts can bypass privacy filters while schema validation remains ac
     const result = sanitizePublicPost(manualPost, '', { applyPrivacyFilters: false });
     assert.deepEqual(result, manualPost);
     assert.equal(publicPostSchema.safeParse(result).success, true);
+});
+test('audio sharing preference is retained and changes the approval snapshot', () => {
+    const withAudio = sanitizePublicPost(sample);
+    const withoutAudio = sanitizePublicPost({ ...sample, includeAudio: false });
+    assert.equal(withAudio.includeAudio, true);
+    assert.equal(withoutAudio.includeAudio, false);
+    assert.equal(hasMatchingApproval(withoutAudio, withAudio), false);
 });

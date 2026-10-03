@@ -371,7 +371,7 @@ app.get('/api/incidents/:id', { preHandler: [requireRoles(...roles)] }, async (r
         renderedPost: publicPostSchema.safeParse(incident.public_data).success ? renderOfficialPost(incident.public_data) : '',
         audioUrl: canReview && incident.playable_path ? `/api/incidents/${id}/audio` : null,
         originalUrl: canReview && incident.original_path ? `/api/incidents/${id}/original` : null,
-        publicAudioUrl: incident.playable_path && incident.public_data?.sensitivity !== 'high' && ['approved', 'publish_queued', 'publish_failed', 'publish_unknown', 'published'].includes(incident.status) ? `${(process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '')}/public/audio/${publicAudioToken(id)}` : null,
+        publicAudioUrl: incident.public_data?.includeAudio !== false && incident.playable_path && incident.public_data?.sensitivity !== 'high' && ['approved', 'publish_queued', 'publish_failed', 'publish_unknown', 'published'].includes(incident.status) ? `${(process.env.PUBLIC_BASE_URL ?? '').replace(/\/$/, '')}/public/audio/${publicAudioToken(id)}` : null,
         approvals: approvals.rows, audit: audits.rows
     };
 });
@@ -478,7 +478,7 @@ app.get('/public/audio/:token', async (request, reply) => {
     if (!/^[a-f0-9]{32}$/.test(token))
         return reply.code(404).send({ error: 'Audio not found' });
     const result = await query(`SELECT i.playable_path FROM incidents i
-    WHERE i.audio_token_hash=$1 AND i.public_data->>'sensitivity' <> 'high' AND i.status IN ('approved','publish_queued','publish_failed','publish_unknown','published')
+    WHERE i.audio_token_hash=$1 AND i.public_data->>'sensitivity' <> 'high' AND i.public_data->>'includeAudio' IS DISTINCT FROM 'false' AND i.status IN ('approved','publish_queued','publish_failed','publish_unknown','published')
     AND EXISTS (SELECT 1 FROM approvals a WHERE a.incident_id=i.id AND a.public_snapshot=i.public_data)`, [hashToken(token)]);
     const path = result.rows[0]?.playable_path;
     if (!path)

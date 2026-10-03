@@ -130,6 +130,8 @@ audio { width: 100%; height: 36px; }
 .editor-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .editor-grid label,.modal label,.inline-form label { display: grid; gap: 5px; color: #53615c; font-size: 10px; font-weight: 700; }
 .editor-grid input,.editor-grid select { width: 100%; font-size: 11px; }
+.editor-grid .audio-share-option { display: flex; align-items: center; gap: 8px; }
+.editor-grid .audio-share-option input { width: 16px; min-width: 16px; height: 16px; margin: 0; padding: 0; }
 .editor-grid input:disabled,.editor-grid select:disabled { color: #54615c; background: #f1f4f1; }
 .span-two { grid-column: 1 / -1; }
 .post-preview { margin-top: 14px; padding: 12px 14px; border: 1px solid #ccd8d1; border-left: 3px solid var(--teal); border-radius: 3px; background: #f3f7f4; }

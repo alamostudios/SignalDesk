@@ -5,6 +5,7 @@ export const publicPostSchema = z.object({
     location: z.string().trim().max(120),
     extraInfo: z.string().trim().max(160).default(''),
     timeReceived: z.string().trim().regex(/^([01]\d|2[0-3]):[0-5]\d hrs$/),
+    includeAudio: z.boolean().default(true),
     sensitivity: z.enum(['low', 'moderate', 'high']),
     suggestedImage: z.string().nullable().default(null)
 }).strict();

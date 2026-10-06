@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
-import { Activity, AudioLines, Check, ChevronRight, CircleAlert, Clock3, FilePlus2, History, ImagePlus, LogOut, Radio, Search, Settings2, ShieldCheck, SlidersHorizontal, Upload, X } from 'lucide-react';
+import { Activity, AudioLines, Check, ChevronRight, CircleAlert, Clock3, FilePlus2, History, ImagePlus, LogOut, Radio, Search, Settings2, ShieldCheck, SlidersHorizontal, Terminal, Upload, X } from 'lucide-react';
 
 type User = { id: string; email: string; role: 'Admin' };
 type PublicPost = { jurisdiction: string; call: string; location: string; extraInfo: string; timeReceived: string; includeAudio: boolean; sensitivity: 'low'|'moderate'|'high'; suggestedImage: string|null };
-type Summary = { id: string; talkgroup_id: string; talkgroup_label: string; event_type: string; status: string; received_at: string; public_data: PublicPost; image_id: string|null; image_name: string|null; facebook_post_id?: string; publish_error?: string };
+type Summary = { id: string; talkgroup_id: string; talkgroup_label: string; event_type: string; status: string; priority: 'high'|'medium'|'low'; received_at: string; public_data: PublicPost; image_id: string|null; image_name: string|null; facebook_post_id?: string; publish_error?: string };
 type Detail = Summary & { transcript: string|null; internal_data: Record<string, unknown>|null; original_path?: string|null; source_metadata?: Record<string, unknown>; audioUrl: string|null; originalUrl: string|null; publicAudioUrl: string|null; renderedPost: string; approvals: { created_at: string; email: string }[]; audit: { action: string; details: Record<string, unknown>; created_at: string; email: string|null }[] };
 type Talkgroup = { id: string; label: string; enabled: boolean };
 type ImageRecord = { id: string; name: string; location: string; enabled: boolean };
 type RadioKey = { id: string; name: string; system_id: string; talkgroup_ids: string[]; enabled: boolean; created_at: string; last_used_at: string|null };
-type Tab = 'queue'|'history'|'settings'|'audit';
+type ReceiverRequest = { id: number; received_at: string; method: string; path: string; status_code: number; system_id: string|null; talkgroup_id: string|null; summary: string; details: Record<string, unknown> };
+type Tab = 'calls'|'queue'|'history'|'settings'|'audit'|'receiver';
 
 const emptyPost = (): PublicPost => ({ jurisdiction: '', call: '', location: '', extraInfo: '', timeReceived: new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date()) + ' hrs', includeAudio: true, sensitivity: 'low', suggestedImage: null });
 const statusLabels: Record<string,string> = { processing: 'Processing', draft: 'Needs review', approved: 'Approved', rejected: 'Rejected', publish_queued: 'Publishing', published: 'Published', publish_failed: 'Publish failed', publish_unknown: 'Verify Facebook' };
@@ -29,7 +30,7 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [tab, setTab] = useState<Tab>('queue');
+  const [tab, setTab] = useState<Tab>('calls');
   const [incidents, setIncidents] = useState<Summary[]>([]);
   const [selectedId, setSelectedId] = useState(new URLSearchParams(location.search).get('incident') ?? '');
   const [detail, setDetail] = useState<Detail|null>(null);
@@ -50,8 +51,7 @@ export default function App() {
   const [serviceStatus, setServiceStatus] = useState({ apiOnline: false, workerOnline: false });
   const [modal, setModal] = useState(false);
   const [newPost, setNewPost] = useState<PublicPost>(emptyPost());
-  const [newTalkgroup, setNewTalkgroup] = useState({ id: '', label: '' });
-  const [newRadioKey, setNewRadioKey] = useState({ name: '', systemId: '', talkgroupIds: [] as string[] });
+  const [newRadioKey, setNewRadioKey] = useState({ name: '', systemId: '' });
   const [createdRadioKey, setCreatedRadioKey] = useState('');
   const [reconcilePostId, setReconcilePostId] = useState('');
   const modalRef = useRef<HTMLElement|null>(null);
@@ -68,6 +68,7 @@ export default function App() {
     if (statusFilter) params.set('status', statusFilter);
     if (talkgroupFilter) params.set('talkgroup', talkgroupFilter);
     if (search.trim()) params.set('q', search.trim());
+    if (tab === 'calls') params.set('callsOnly', 'true');
     const result = await request<{ incidents: Summary[] }>(`/incidents?${params}`, token);
     setIncidents(result.incidents);
   }
@@ -110,10 +111,15 @@ export default function App() {
 
   useEffect(() => {
     if (!user) return;
-    void Promise.all([loadQueue(), loadSupportData()]).catch(error => setNotice(error.message));
+    void loadSupportData().catch(error => setNotice(error.message));
+  }, [user, isAdmin]);
+
+  useEffect(() => {
+    if (!user) return;
+    void loadQueue().catch(error => setNotice(error.message));
     const timer = window.setInterval(() => { void loadQueue().catch(() => undefined); }, 8000);
     return () => window.clearInterval(timer);
-  }, [user, statusFilter, talkgroupFilter, search]);
+  }, [user, statusFilter, talkgroupFilter, search, tab]);
 
   useEffect(() => { if (selectedId) void loadDetails(selectedId).catch(error => setNotice(error.message)); else setDetail(null); }, [selectedId, token]);
 
@@ -211,6 +217,17 @@ export default function App() {
     await perform(`/incidents/${detail.id}`, 'PATCH', { publicData: postDraft, imageId: imageId || null }, 'Draft saved. Approval was cleared until the revised post is approved.');
   }
 
+  async function changePriority(priority: Summary['priority']) {
+    if (!detail || priority === detail.priority) return;
+    setBusy(true); setNotice('');
+    try {
+      await request(`/incidents/${detail.id}/priority`, token, { method: 'PATCH', body: JSON.stringify({ priority }) });
+      await Promise.all([loadQueue(), loadDetails(detail.id)]);
+      setNotice(`Internal priority changed to ${priority}`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Priority could not be changed'); }
+    finally { setBusy(false); }
+  }
+
   async function approvePost() {
     if (!detail) return;
     setBusy(true); setNotice('');
@@ -254,22 +271,12 @@ export default function App() {
     finally { setBusy(false); event.target.value = ''; }
   }
 
-  async function addTalkgroup(event: FormEvent) {
-    event.preventDefault();
-    try { await request('/talkgroups', token, { method: 'POST', body: JSON.stringify({ ...newTalkgroup, enabled: true }) }); setNewTalkgroup({ id:'', label:'' }); await loadSupportData(); setNotice('Talkgroup saved'); }
-    catch (error) { setNotice(error instanceof Error ? error.message : 'Talkgroup not saved'); }
-  }
-
-  function toggleRadioKeyTalkgroup(talkgroupId: string) {
-    setNewRadioKey(current => ({ ...current, talkgroupIds: current.talkgroupIds.includes(talkgroupId) ? current.talkgroupIds.filter(id => id !== talkgroupId) : [...current.talkgroupIds, talkgroupId] }));
-  }
-
   async function createRadioKey(event: FormEvent) {
     event.preventDefault();
     try {
       const result = await request<{ apiKey: string }>('/radio-keys', token, { method: 'POST', body: JSON.stringify(newRadioKey) });
       setCreatedRadioKey(result.apiKey);
-      setNewRadioKey({ name: '', systemId: '', talkgroupIds: [] });
+      setNewRadioKey({ name: '', systemId: '' });
       await loadSupportData();
       setNotice('Receiver key created. Copy it now; it will not be shown again.');
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Receiver key not created'); }
@@ -284,11 +291,6 @@ export default function App() {
   async function copyRadioKey() {
     try { await navigator.clipboard.writeText(createdRadioKey); setNotice('Receiver key copied'); }
     catch { setNotice('Clipboard access was denied. Select the displayed key and copy it manually.'); }
-  }
-
-  async function toggleTalkgroup(group: Talkgroup) {
-    try { await request('/talkgroups', token, { method: 'POST', body: JSON.stringify({ id: group.id, label: group.label, enabled: !group.enabled }) }); await loadSupportData(); setNotice('Talkgroup configuration updated'); }
-    catch (error) { setNotice(error instanceof Error ? error.message : 'Talkgroup not updated'); }
   }
 
   async function toggleImage(image: ImageRecord) {
@@ -311,7 +313,9 @@ export default function App() {
     {loginError && <p role="alert" className="form-error">{loginError}</p>}<button className="primary full-width" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}<ChevronRight size={17}/></button>
   </form></main>;
 
-  const visibleIncidents = tab === 'queue' ? incidents.filter(item => !['published','rejected'].includes(item.status)) : incidents;
+  const openIncidents = incidents.filter(item => !['published','rejected'].includes(item.status));
+  const callIncidents = openIncidents.filter(item => item.priority === 'high' || item.priority === 'medium');
+  const visibleIncidents = tab === 'calls' ? callIncidents : tab === 'queue' ? openIncidents : incidents;
 
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to incidents</a>
@@ -322,8 +326,10 @@ export default function App() {
     </header>
     <div className="workspace">
       <nav className="rail" aria-label="Primary navigation">
-        <button className={tab==='queue'?'rail-button active':'rail-button'} onClick={() => setTab('queue')}><Activity size={18}/><span>Live queue</span><b>{counts.draft ?? 0}</b></button>
+        <button className={tab==='calls'?'rail-button active':'rail-button'} onClick={() => setTab('calls')}><CircleAlert size={18}/><span>Calls</span><b>{callIncidents.length}</b></button>
+        <button className={tab==='queue'?'rail-button active':'rail-button'} onClick={() => setTab('queue')}><Activity size={18}/><span>All Traffic</span></button>
         <button className={tab==='history'?'rail-button active':'rail-button'} onClick={() => setTab('history')}><History size={18}/><span>History</span></button>
+        <button className={tab==='receiver'?'rail-button active':'rail-button'} onClick={() => setTab('receiver')}><Terminal size={18}/><span>Receiver monitor</span></button>
         {isAdmin && <button className={tab==='settings'?'rail-button active':'rail-button'} onClick={() => setTab('settings')}><Settings2 size={18}/><span>Configuration</span></button>}
         {isAdmin && <button className={tab==='audit'?'rail-button active':'rail-button'} onClick={() => setTab('audit')}><ShieldCheck size={18}/><span>Audit log</span></button>}
         <div className="rail-foot"><div className="service-state"><span className={serviceStatus.workerOnline?'':'offline'}/><div><strong>PROCESSING</strong><small>{serviceStatus.workerOnline?'Workers online':'Worker unavailable'}</small></div></div><p>PRIVATE REVIEW WORKSPACE</p></div>
@@ -332,25 +338,22 @@ export default function App() {
       <main id="main-content" className="main-area">
         {tab === 'settings' ? <section className="settings-page">
           <div className="page-heading"><div><p className="eyebrow">ADMINISTRATION</p><h1>Configuration</h1></div><span className="role-chip">ADMIN ONLY</span></div>
-          <section className="settings-section"><div className="section-heading"><div><h2>Selected talkgroups</h2><p>Only enabled talkgroups enter the incident queue.</p></div></div>
-            <form className="inline-form" onSubmit={addTalkgroup}><label>Talkgroup ID<input required value={newTalkgroup.id} onChange={e=>setNewTalkgroup({...newTalkgroup,id:e.target.value})}/></label><label>Display name<input required value={newTalkgroup.label} onChange={e=>setNewTalkgroup({...newTalkgroup,label:e.target.value})}/></label><button className="primary"><Check size={16}/>Add talkgroup</button></form>
-            <div className="data-table">{talkgroups.map(group=><div className="table-row" key={group.id}><code>{group.id}</code><strong>{group.label}</strong><span className={group.enabled?'status-text good':'status-text'}>{group.enabled?'Enabled':'Disabled'}</span><button className="table-action" onClick={()=>toggleTalkgroup(group)}>{group.enabled?'Disable':'Enable'}</button></div>)}</div>
+          <section className="settings-section"><div className="section-heading"><div><h2>Discovered talkgroups</h2><p>Automatically listed from received Rdio Scanner calls; no separate setup is required.</p></div></div>
+            <div className="data-table">{talkgroups.map(group=><div className="table-row discovered-talkgroup" key={group.id}><code>{group.id}</code><strong>{group.label}</strong><span className="status-text good">Discovered</span></div>)}{talkgroups.length===0 && <p className="muted">Talkgroups will appear here when the receiver sends calls.</p>}</div>
           </section>
-          <section className="settings-section"><div className="section-heading"><div><h2>SDRTrunk / Rdio Scanner receiver keys</h2><p>Keys are restricted to one system ID and selected enabled talkgroups.</p></div></div>
-            <form className="inline-form receiver-key-form" onSubmit={createRadioKey}><label>Key name<input required value={newRadioKey.name} onChange={event=>setNewRadioKey({...newRadioKey,name:event.target.value})} placeholder="Dispatch console"/></label><label>System ID<input type="number" min="1" step="1" required value={newRadioKey.systemId} onChange={event=>setNewRadioKey({...newRadioKey,systemId:event.target.value})} placeholder="1"/></label><button className="primary" disabled={!newRadioKey.talkgroupIds.length}><ShieldCheck size={16}/>Generate key</button>
-              <fieldset className="key-talkgroups"><legend>Allowed talkgroups</legend>{talkgroups.filter(group=>group.enabled).map(group=><label key={group.id}><input type="checkbox" checked={newRadioKey.talkgroupIds.includes(group.id)} onChange={()=>toggleRadioKeyTalkgroup(group.id)}/><span>{group.label}</span><code>{group.id}</code></label>)}{talkgroups.every(group=>!group.enabled) && <p>Add and enable talkgroups first.</p>}</fieldset>
-            </form>
+          <section className="settings-section"><div className="section-heading"><div><h2>Rdio Scanner receiver keys</h2><p>Keys are restricted to one System ID and accept every talkgroup sent by Rdio Scanner.</p></div></div>
+            <form className="inline-form receiver-key-form" onSubmit={createRadioKey}><label>Key name<input required value={newRadioKey.name} onChange={event=>setNewRadioKey({...newRadioKey,name:event.target.value})} placeholder="Dispatch console"/></label><label>System ID<input type="number" min="1" step="1" required value={newRadioKey.systemId} onChange={event=>setNewRadioKey({...newRadioKey,systemId:event.target.value})} placeholder="1"/></label><button className="primary"><ShieldCheck size={16}/>Generate key</button></form>
             {createdRadioKey && <div className="new-key-reveal" role="status"><div><strong>New key</strong><small>Copy now. It will not be displayed again.</small></div><code>{createdRadioKey}</code><button className="secondary" onClick={()=>void copyRadioKey()}>Copy key</button><button className="icon-button" title="Hide key" aria-label="Hide generated key" onClick={()=>setCreatedRadioKey('')}><X size={16}/></button></div>}
-            <div className="radio-key-list">{radioKeys.map(key=><div className="radio-key-row" key={key.id}><div><strong>{key.name}</strong><small>System {key.system_id} · {key.talkgroup_ids.map(id=>talkgroups.find(group=>group.id===id)?.label ?? id).join(', ')}</small><small>{key.last_used_at ? `Last used ${new Date(key.last_used_at).toLocaleString()}` : `Created ${new Date(key.created_at).toLocaleString()}`}</small></div><span className={key.enabled?'status-text good':'status-text'}>{key.enabled?'Active':'Revoked'}</span>{key.enabled && <button className="table-action" onClick={()=>void revokeRadioKey(key)}>Revoke</button>}</div>)}</div>
+            <div className="radio-key-list">{radioKeys.map(key=><div className="radio-key-row" key={key.id}><div><strong>{key.name}</strong><small>System {key.system_id} · All talkgroups</small><small>{key.last_used_at ? `Last used ${new Date(key.last_used_at).toLocaleString()}` : `Created ${new Date(key.created_at).toLocaleString()}`}</small></div><span className={key.enabled?'status-text good':'status-text'}>{key.enabled?'Active':'Revoked'}</span>{key.enabled && <button className="table-action" onClick={()=>void revokeRadioKey(key)}>Revoke</button>}</div>)}</div>
           </section>
           <section className="settings-section"><div className="section-heading"><div><h2>Location image bank</h2><p>Only these configured images can be attached to a post.</p></div></div>
             <form className="inline-form image-form" onSubmit={addImage}><label>Image file<input type="file" name="file" accept="image/png,image/jpeg,image/webp" required/></label><label>Image name<input name="name" placeholder="Fulton.png" required/></label><label>Location<input name="location" placeholder="Fulton County" required/></label><button className="secondary"><ImagePlus size={16}/>Add image</button></form>
             <div className="image-bank">{images.map(image=><div className="image-bank-item" key={image.id}><div className="image-swatch"><ImagePlus size={18}/></div><div><strong>{image.name}</strong><small>{image.location}</small></div><button className="table-action" onClick={()=>toggleImage(image)}>{image.enabled?'Disable':'Enable'}</button></div>)}</div>
           </section>
           <p className="settings-note"><SlidersHorizontal size={16}/> Tone frequencies, correlation window, AI provider, and Facebook credentials are managed in the deployment environment.</p>
-        </section> : tab === 'audit' ? <AuditPanel token={token}/> : <>
-          <div className="page-heading"><div><p className="eyebrow">{tab==='queue'?'MONITOR / REVIEW':'RECORDS / SEARCH'}</p><h1>{tab==='queue'?'Incident queue':'Incident history'}</h1></div><div className="heading-actions"><span className="sync-stamp"><span className="live-indicator"/>Updates every 8 seconds</span>{canReview && <button ref={manualButtonRef} className="primary" onClick={()=>setModal(true)}><FilePlus2 size={16}/>New manual post</button>}</div></div>
-          <div className="metrics-row"><div><span>AWAITING REVIEW</span><strong>{counts.draft ?? 0}</strong></div><div><span>PROCESSING</span><strong>{counts.processing ?? 0}</strong></div><div><span>APPROVED</span><strong>{counts.approved ?? 0}</strong></div><div><span>PUBLISHED</span><strong>{counts.published ?? 0}</strong></div></div>
+        </section> : tab === 'audit' ? <AuditPanel token={token}/> : tab === 'receiver' ? <ReceiverMonitor token={token}/> : <>
+          <div className="page-heading"><div><p className="eyebrow">{tab==='calls'?'HIGH / MEDIUM PRIORITY':tab==='queue'?'ALL RECEIVED TRAFFIC':'RECORDS / SEARCH'}</p><h1>{tab==='calls'?'Calls':tab==='queue'?'All Traffic':'Incident history'}</h1></div><div className="heading-actions"><span className="sync-stamp"><span className="live-indicator"/>Updates every 8 seconds</span>{canReview && <button ref={manualButtonRef} className="primary" onClick={()=>setModal(true)}><FilePlus2 size={16}/>New manual post</button>}</div></div>
+          <div className="metrics-row"><div><span>HIGH PRIORITY</span><strong>{openIncidents.filter(item=>item.priority==='high').length}</strong></div><div><span>MEDIUM PRIORITY</span><strong>{openIncidents.filter(item=>item.priority==='medium').length}</strong></div><div><span>LOW TRAFFIC</span><strong>{openIncidents.filter(item=>item.priority==='low').length}</strong></div><div><span>PROCESSING</span><strong>{counts.processing ?? 0}</strong></div></div>
           <div className="content-grid">
             <section className="incident-list" aria-label="Incidents">
               <div className="list-tools"><label className="search-box"><Search size={16}/><input aria-label="Search incidents" placeholder="Search calls, locations..." value={search} onChange={event=>setSearch(event.target.value)}/></label>
@@ -359,12 +362,13 @@ export default function App() {
               </div>
               <div className="list-count" aria-live="polite" aria-atomic="true"><span>{visibleIncidents.length} INCIDENTS</span><span>NEWEST FIRST</span></div>
               <div className="incident-items">{visibleIncidents.map(item=><button key={item.id} className={`incident-row ${selectedId===item.id?'selected':''}`} onClick={()=>selectIncident(item.id)} aria-current={selectedId===item.id?'true':undefined}>
-                <span className={`status-marker ${item.status}`} aria-hidden="true"/><span className="incident-copy"><span className="incident-line"><strong>{item.public_data?.call || (item.event_type==='tone'?'Page tone detected':'New radio call')}</strong><span className={`status-pill ${item.status}`}>{statusLabels[item.status] ?? item.status}</span></span><span className="incident-subline">{item.talkgroup_label} <span>·</span> {item.public_data?.location || 'Location pending'}</span><span className="incident-time"><Clock3 size={12}/>{new Date(item.received_at).toLocaleString()}</span></span><ChevronRight className="row-chevron" size={16}/>
-              </button>)}{visibleIncidents.length===0 && <div className="empty-list"><AudioLines size={25}/><strong>No matching incidents</strong><span>New selected talkgroups appear here as calls arrive.</span></div>}</div>
+                <span className={`status-marker ${item.priority}`} aria-hidden="true"/><span className="incident-copy"><span className="incident-line"><strong>{item.public_data?.call || (item.event_type==='tone'?'Page tone detected':'Radio call details pending')}</strong><span className={`priority-pill ${item.priority}`}>{item.priority}</span><span className={`status-pill ${item.status}`}>{statusLabels[item.status] ?? item.status}</span></span><span className="incident-subline">{item.talkgroup_label} <span>·</span> {item.public_data?.location || 'Location pending'}</span><span className="incident-time"><Clock3 size={12}/>{new Date(item.received_at).toLocaleString()}</span></span><ChevronRight className="row-chevron" size={16}/>
+              </button>)}{visibleIncidents.length===0 && <div className="empty-list"><AudioLines size={25}/><strong>{tab==='calls'?'No high- or medium-priority calls':'No matching incidents'}</strong><span>{tab==='calls'?'Urgent and response-request calls appear here.':'Incoming Rdio Scanner calls appear here as they arrive.'}</span></div>}</div>
             </section>
             <section className="detail-panel" aria-label="Incident review">
               {detail ? <>
                 <div className="detail-header"><div><p className="eyebrow">{detail.talkgroup_label} / {detail.event_type.toUpperCase()}</p><h2>{detail.public_data?.call || 'Incident details'}</h2><p className="detail-time">Received {new Date(detail.received_at).toLocaleString()}</p></div><span className={`status-pill large ${detail.status}`}>{statusLabels[detail.status] ?? detail.status}</span></div>
+                {canReview && <label className="internal-priority">Internal priority<select value={detail.priority} onChange={event=>void changePriority(event.target.value as Summary['priority'])} disabled={busy}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select><small>Internal triage only; not included in the public post.</small></label>}
                 {detail.publish_error && <div className="warning-banner" role="alert"><CircleAlert size={17}/><span>{detail.publish_error}</span></div>}
                 {detail.status==='publish_unknown' && <div className="reconcile-panel"><div className="warning-banner" role="alert"><CircleAlert size={17}/><span>Facebook's response was inconclusive. Do not retry until the Page has been checked.</span></div>{isAdmin && <><form className="reconcile-form" onSubmit={event=>{event.preventDefault();if(reconcilePostId.trim())void resolvePublication(reconcilePostId.trim());}}><label>Facebook post ID, if published<input value={reconcilePostId} onChange={event=>setReconcilePostId(event.target.value)} maxLength={200}/></label><button className="secondary" disabled={busy || !reconcilePostId.trim()}>Record published post</button></form><button className="reject-button" disabled={busy} onClick={()=>void resolvePublication()}>Confirm not published</button></>}</div>}
                 {canReview && typeof detail.source_metadata?.processingError === 'string' && <div className="warning-banner" role="alert"><CircleAlert size={17}/><span>{detail.source_metadata.processingError}</span><button className="table-action" onClick={()=>perform(`/incidents/${detail.id}/reprocess`,'POST',{},'Audio processing queued again')}>Retry processing</button></div>}
@@ -391,7 +395,7 @@ export default function App() {
     </div>
     {notice && <div className="toast" role="status"><span>{notice}</span><button aria-label="Dismiss message" onClick={()=>setNotice('')}><X size={15}/></button></div>}
     {modal && <div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(event.target===event.currentTarget)setModal(false);}}><section ref={modalRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="manual-title"><div className="modal-heading"><div><p className="eyebrow">REVIEWER CREATED</p><h2 id="manual-title">New manual post</h2></div><button className="icon-button" aria-label="Close dialog" onClick={()=>setModal(false)}><X size={18}/></button></div>
-      <form onSubmit={createManualPost}><label>Talkgroup<select name="talkgroupId" required defaultValue=""><option value="" disabled>Select talkgroup</option>{talkgroups.filter(tg=>tg.enabled).map(tg=><option key={tg.id} value={tg.id}>{tg.label}</option>)}</select></label>
+      <form onSubmit={createManualPost}><label>Talkgroup<input name="talkgroupId" list="known-talkgroups" required placeholder="Enter talkgroup ID"/><datalist id="known-talkgroups">{talkgroups.map(tg=><option key={tg.id} value={tg.id}>{tg.label}</option>)}</datalist></label>
         <label>Jurisdiction<input required value={newPost.jurisdiction} onChange={e=>setNewPost({...newPost,jurisdiction:e.target.value})}/></label><label>Call<input required value={newPost.call} onChange={e=>setNewPost({...newPost,call:e.target.value})}/></label><label>Location / intersection<input value={newPost.location} onChange={e=>setNewPost({...newPost,location:e.target.value})}/></label><label>Time received<input value={newPost.timeReceived} onChange={e=>setNewPost({...newPost,timeReceived:e.target.value})}/></label>
         <div className="modal-actions"><button type="button" className="secondary" onClick={()=>setModal(false)}>Cancel</button><button className="primary" disabled={busy}>Create draft<ChevronRight size={16}/></button></div>
       </form></section></div>}
@@ -403,4 +407,50 @@ function AuditPanel({ token }: { token: string }) {
   const [error, setError] = useState('');
   useEffect(() => { request<{entries:typeof entries}>('/audit?limit=200',token).then(result=>setEntries(result.entries)).catch(reason=>setError(reason.message)); }, [token]);
   return <section className="settings-page"><div className="page-heading"><div><p className="eyebrow">ADMINISTRATION</p><h1>Audit log</h1></div></div><section className="settings-section"><div className="section-heading"><div><h2>Recent activity</h2><p>Approval, edits, administration, and publication actions.</p></div></div>{error && <p role="alert" className="form-error">{error}</p>}<div className="audit-list full-audit">{entries.map(entry=><div key={entry.id}><span className="audit-dot"/><strong>{entry.action}</strong><span>{entry.email ?? 'System'}</span><time>{new Date(entry.created_at).toLocaleString()}</time><details><summary>Details</summary><pre>{JSON.stringify(entry.details,null,2)}</pre></details></div>)}</div></section></section>;
+}
+
+function ReceiverMonitor({ token }: { token: string }) {
+  const [entries, setEntries] = useState<ReceiverRequest[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    let afterId = 0;
+    const poll = async () => {
+      try {
+        const result = await request<{ requests: ReceiverRequest[] }>(`/receiver-requests?afterId=${afterId}&limit=100`, token);
+        if (!active) return;
+        if (result.requests.length) {
+          afterId = Number(result.requests.at(-1)!.id);
+          setEntries(current => [...current, ...result.requests].slice(-500));
+        }
+        setConnected(true);
+        setError('');
+      } catch (reason) {
+        if (active) { setConnected(false); setError(reason instanceof Error ? reason.message : 'Monitor unavailable'); }
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token]);
+
+  return <section className="receiver-monitor-page">
+    <div className="page-heading"><div><p className="eyebrow">RDIO SCANNER / INPUT</p><h1>Receiver monitor</h1></div><span className={connected ? 'monitor-connection connected' : 'monitor-connection'}><span/>{connected ? 'LIVE' : 'RECONNECTING'}</span></div>
+    <div className="receiver-terminal" aria-label="Read-only Rdio Scanner request log">
+      <div className="receiver-terminal-head"><span>READ-ONLY REQUEST STREAM</span><span>LAST {entries.length} / 500</span></div>
+      <div className="receiver-terminal-lines" aria-live="polite" aria-relevant="additions">
+        {entries.map(entry => <div className="receiver-terminal-line" key={entry.id}>
+          <time>{new Date(entry.received_at).toLocaleTimeString()}</time>
+          <strong className={entry.status_code < 400 ? 'request-status accepted' : 'request-status rejected'}>{entry.status_code}</strong>
+          <code>{entry.method} {entry.path}</code>
+          <span className="request-scope">SYS {entry.system_id ?? '--'} / TG {entry.talkgroup_id ?? '--'}</span>
+          <span className="request-summary">{entry.summary}{typeof entry.details.audioBytes === 'number' && entry.details.audioBytes > 0 ? ` · ${entry.details.audioBytes.toLocaleString()} bytes` : ''}</span>
+        </div>)}
+        {!entries.length && <p className="receiver-terminal-empty">{error || 'Waiting for Rdio Scanner requests...'}</p>}
+      </div>
+    </div>
+    {error && entries.length > 0 && <p className="monitor-error" role="status">Monitor reconnecting: {error}</p>}
+  </section>;
 }

@@ -3,6 +3,8 @@ import { test } from 'node:test';
 import { generalizeAddress, sanitizePublicPost } from './privacy.js';
 import { hasMatchingApproval, publicPostSchema, renderOfficialPost } from './types.js';
 import { detectConfiguredTones } from './tones.js';
+import { suggestCall, suggestPriority } from './priorities.js';
+import { OpenAICompatibleWhisper } from './adapters.js';
 
 const sample = {
   jurisdiction: 'Fulton County', call: '10-50 Rollover', location: '123 Main Street',
@@ -98,4 +100,53 @@ test('audio sharing preference is retained and changes the approval snapshot', (
   assert.equal(withAudio.includeAudio, true);
   assert.equal(withoutAudio.includeAudio, false);
   assert.equal(hasMatchingApproval(withoutAudio, withAudio), false);
+});
+
+test('suggests high internal priority for urgent call phrases', () => {
+  for (const phrase of ['10-50 rollover', 'roll over', '10-0', 'crash detection']) {
+    assert.equal(suggestPriority(`Dispatch reports ${phrase}`), 'high', phrase);
+  }
+});
+
+test('suggests medium internal priority for response requests', () => {
+  for (const phrase of ['Request you be en route', 'to the area of Oak and Main', 'CP', 'CP Advises units are needed']) {
+    assert.equal(suggestPriority(phrase), 'medium', phrase);
+  }
+});
+
+test('defaults unmatched or missing transcript to low priority and high takes precedence', () => {
+  assert.equal(suggestPriority('Routine traffic, no assistance needed'), 'low');
+  assert.equal(suggestPriority(''), 'low');
+  assert.equal(suggestPriority('CP advises possible 10-50'), 'high');
+});
+
+test('suggests concise call titles from transcript phrases without inventing other fields', () => {
+  assert.equal(suggestCall('Traffic advises a 10-50 rollover on Main'), '10-50 rollover');
+  assert.equal(suggestCall('CP advises units are needed'), 'CP advises');
+  assert.equal(suggestCall('Routine radio check'), null);
+});
+
+test('sends audio to the configured whisper.cpp inference endpoint', async () => {
+  const previousBase = process.env.WHISPER_BASE_URL;
+  const previousPath = process.env.WHISPER_API_PATH;
+  const previousFetch = globalThis.fetch;
+  process.env.WHISPER_BASE_URL = 'http://whisper.local:8080';
+  process.env.WHISPER_API_PATH = '/inference';
+  globalThis.fetch = async (input, init) => {
+    assert.equal(String(input), 'http://whisper.local:8080/inference');
+    const form = init?.body as FormData;
+    assert.equal(form.get('response_format'), 'json');
+    assert.equal(form.get('temperature'), '0');
+    assert.equal(form.get('model'), null);
+    return new Response(JSON.stringify({ text: 'Request you be en route' }), { status: 200 });
+  };
+  try {
+    assert.equal(await new OpenAICompatibleWhisper().transcribe(Buffer.from('audio')), 'Request you be en route');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousBase === undefined) delete process.env.WHISPER_BASE_URL;
+    else process.env.WHISPER_BASE_URL = previousBase;
+    if (previousPath === undefined) delete process.env.WHISPER_API_PATH;
+    else process.env.WHISPER_API_PATH = previousPath;
+  }
 });

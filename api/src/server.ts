@@ -23,10 +23,26 @@ declare module '@fastify/jwt' {
   interface FastifyJWT { payload: UserClaims; user: UserClaims }
 }
 
-const app = Fastify({ logger: true, bodyLimit: 100 * 1024 * 1024, trustProxy: true });
+const app = Fastify({ logger: true, bodyLimit: 100 * 1024 * 1024, trustProxy: true, ignoreTrailingSlash: true });
 const roles: UserRole[] = ['Admin', 'Reviewer', 'Viewer'];
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 const publicAudioToken = (incidentId: string) => createHmac('sha256', process.env.PUBLIC_AUDIO_SECRET ?? process.env.JWT_SECRET ?? 'development-only-audio-secret').update(incidentId).digest('hex').slice(0, 32);
+type ReceiverRequestContext = { systemId?: string; talkgroupId?: string; summary: string; details?: Record<string, unknown> };
+const receiverRequestContexts = new WeakMap<FastifyRequest, ReceiverRequestContext>();
+
+app.addHook('onResponse', async (request, reply) => {
+  if (request.routeOptions.url !== '/api/call-upload') return;
+  const context = receiverRequestContexts.get(request) ?? { summary: 'Request rejected before parsing' };
+  const stored = await query<{ id: number }>(`INSERT INTO receiver_requests(method,path,status_code,system_id,talkgroup_id,summary,details)
+    VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`, [request.method, request.routeOptions.url, reply.statusCode,
+    context.systemId ?? null, context.talkgroupId ?? null, context.summary, context.details ?? {}])
+    .catch(error => app.log.error({ error }, 'Could not record receiver request'));
+  const requestId = stored?.rows[0]?.id;
+  if (requestId && requestId % 100 === 0) {
+    await query('DELETE FROM receiver_requests WHERE id < (SELECT id FROM receiver_requests ORDER BY id DESC OFFSET 9999 LIMIT 1)')
+      .catch(error => app.log.error({ error }, 'Could not trim receiver request history'));
+  }
+});
 
 app.addContentTypeParser(['audio/mpeg','application/octet-stream'], { parseAs: 'buffer', bodyLimit: 64 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
@@ -59,12 +75,9 @@ async function readMultipart(request: FastifyRequest) {
   return { fields, audio };
 }
 
-async function authorizeRadioKey(key: string, systemId: string, talkgroupId?: string) {
+async function authorizeRadioKey(key: string, systemId: string) {
   const hash = hashToken(key);
-  const result = talkgroupId
-    ? await query<{ id: string }>(`SELECT k.id FROM radio_api_keys k JOIN talkgroups t ON t.id=$3 AND t.enabled=true
-      WHERE k.key_hash=$1 AND k.system_id=$2 AND k.enabled=true AND $3=ANY(k.talkgroup_ids)`, [hash, systemId, talkgroupId])
-    : await query<{ id: string }>('SELECT id FROM radio_api_keys WHERE key_hash=$1 AND system_id=$2 AND enabled=true', [hash, systemId]);
+  const result = await query<{ id: string }>('SELECT id FROM radio_api_keys WHERE key_hash=$1 AND system_id=$2 AND enabled=true', [hash, systemId]);
   if (result.rows[0]) void query('UPDATE radio_api_keys SET last_used_at=now() WHERE id=$1', [result.rows[0].id]).catch(error => app.log.warn({ error }, 'Could not update radio key usage time'));
   return result.rows[0]?.id ?? null;
 }
@@ -93,6 +106,13 @@ async function saveUpload(part: Awaited<ReturnType<FastifyRequest['file']>>, id:
   await storage.putStream(name, part.file);
   if (part.file.truncated) throw new Error('Audio exceeds the upload size limit');
   return name;
+}
+
+async function ensureTalkgroup(talkgroupId: string, talkgroupLabel?: string) {
+  const label = talkgroupLabel?.trim().slice(0, 120);
+  await query(`INSERT INTO talkgroups(id,label,enabled) VALUES ($1,$2,true)
+    ON CONFLICT(id) DO UPDATE SET label=CASE WHEN $3::text IS NULL THEN talkgroups.label ELSE $3 END,enabled=true`,
+  [talkgroupId, label || `TG ${talkgroupId}`, label || null]);
 }
 
 async function bootstrapAdmin() {
@@ -190,10 +210,11 @@ app.post('/api/ingest', { config: { rateLimit: { max: 600, timeWindow: '1 minute
   return reply.code(202).send({ accepted: true, incidentId, queued: Boolean(originalPath) });
 });
 
-async function storeInboundRadioCall(input: { systemId: string; talkgroupId: string; receivedAt: Date; externalId: string; audio: Buffer; audioMime: string; metadata: Record<string, unknown>; keyId: string }) {
+async function storeInboundRadioCall(input: { systemId: string; talkgroupId: string; talkgroupLabel?: string; receivedAt: Date; externalId: string; audio: Buffer; audioMime: string; metadata: Record<string, unknown>; keyId: string }) {
   const duplicate = await query<{ id: string }>("SELECT coalesce(merged_into,id) AS id FROM incidents WHERE external_id=$1 OR source_metadata->>'dispatchExternalId'=$1", [input.externalId]);
   if (duplicate.rows[0]) return { id: duplicate.rows[0].id, duplicate: true };
   const id = randomUUID();
+  await ensureTalkgroup(input.talkgroupId, input.talkgroupLabel);
   const extension = input.audioMime.includes('mpeg') ? '.mp3' : input.audioMime.includes('mp4') ? '.m4a' : input.audioMime.includes('ogg') ? '.ogg' : input.audioMime.includes('wav') ? '.wav' : '.audio';
   const originalPath = await saveAudio(input.audio, id, `original${extension}`);
   const correlationSeconds = Math.min(900, Math.max(1, Number(process.env.TONE_CORRELATION_SECONDS ?? 180)));
@@ -221,108 +242,71 @@ async function storeInboundRadioCall(input: { systemId: string; talkgroupId: str
 }
 
 app.post('/api/call-upload', { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } }, async (request, reply) => {
+  const monitor: ReceiverRequestContext = { summary: 'Rdio Scanner request received' };
+  receiverRequestContexts.set(request, monitor);
   try {
     const { fields, audio } = await readMultipart(request);
     const systemId = z.string().trim().min(1).max(50).safeParse(fields.system);
     const talkgroupId = z.string().trim().min(1).max(100).safeParse(fields.talkgroup);
     const key = z.string().min(20).max(200).safeParse(fields.key);
-    const receivedAt = parseRadioTimestamp(fields.timestamp ?? fields.dateTime, 'milliseconds');
-    if (!systemId.success || !talkgroupId.success || !key.success || !receivedAt || !audio || audio.data.length <= 44 || audio.data.length > 64 * 1024 * 1024) {
-      return reply.code(417).send('Incomplete call data\n');
+    monitor.systemId = systemId.success ? systemId.data : undefined;
+    monitor.talkgroupId = talkgroupId.success ? talkgroupId.data : undefined;
+    monitor.details = { audioBytes: audio?.data.length ?? 0, audioMime: audio?.mimetype ?? null, source: fields.source?.slice(0, 100) ?? null };
+    if (!systemId.success || !key.success) {
+      monitor.summary = 'Rejected: missing or invalid System ID/API key';
+      return reply.code(400).type('text/plain').send('Incomplete call data: invalid System ID or API key');
     }
-    const keyId = await authorizeRadioKey(key.data, systemId.data, talkgroupId.data);
-    if (!keyId) return reply.code(401).send('Invalid API key or talkgroup scope\n');
+    const keyId = await authorizeRadioKey(key.data, systemId.data);
+    if (!keyId) {
+      monitor.summary = 'Rejected: receiver key or System ID not authorized';
+      return reply.code(401).type('text/plain').send('Invalid API key or System ID');
+    }
+    if (fields.test !== undefined) {
+      monitor.summary = 'Rdio Scanner connection test accepted';
+      return reply.type('text/plain').send('Incomplete call data: no talkgroup');
+    }
+    const receivedAt = parseRadioTimestamp(fields.timestamp ?? fields.dateTime, 'milliseconds');
+    if (!talkgroupId.success || !receivedAt || !audio || audio.data.length <= 44 || audio.data.length > 64 * 1024 * 1024) {
+      monitor.summary = 'Rejected: incomplete or invalid call data';
+      return reply.code(417).type('text/plain').send('Incomplete call data: missing talkgroup, timestamp, or audio');
+    }
     const recorderFields = { ...fields };
     delete recorderFields.key;
     const inserted = await storeInboundRadioCall({
       systemId: systemId.data, talkgroupId: talkgroupId.data, receivedAt,
+      talkgroupLabel: fields.talkgroupLabel,
       externalId: `rdio-${systemId.data}-${talkgroupId.data}-${receivedAt.getTime()}-${(fields.source ?? '0').slice(0,100)}`,
       audio: audio.data, audioMime: fields.audioMime ?? fields.audioType ?? audio.mimetype,
-      metadata: { recorderFields }, keyId
+      metadata: { talkgroupLabel: fields.talkgroupLabel ?? null, recorderFields }, keyId
     });
+    monitor.summary = inserted.duplicate ? 'Accepted duplicate call' : 'Accepted and queued call';
     return reply.type('text/plain').send(inserted.duplicate ? 'Call imported successfully.\n' : 'Call imported successfully.\n');
   } catch (error) {
+    monitor.summary = 'Upload failed during parsing or storage';
     request.log.error({ error }, 'Rdio Scanner upload failed');
     return reply.code(400).type('text/plain').send('Invalid call upload\n');
   }
 });
 
-app.post('/api/broadcastify/call-upload', { config: { rateLimit: { max: 600, timeWindow: '1 minute' } } }, async (request, reply) => {
-  try {
-    const { fields } = await readMultipart(request);
-    const systemId = z.string().trim().min(1).max(50).safeParse(fields.systemId);
-    const key = z.string().min(20).max(200).safeParse(fields.apiKey);
-    if (!systemId.success || !key.success) return reply.code(400).type('text/plain').send('1 Invalid-API-Key');
-    const keyId = await authorizeRadioKey(key.data, systemId.data, fields.tg);
-    if (!keyId) return reply.code(401).type('text/plain').send(`1 API-Key-Access-Denied`);
-    if (fields.test !== undefined) return reply.type('text/plain').send('Ok');
-    const talkgroupId = z.string().trim().min(1).max(100).safeParse(fields.tg);
-    const timestamp = z.coerce.number().finite().positive().safeParse(fields.ts);
-    const duration = z.coerce.number().finite().positive().max(3600).safeParse(fields.callDuration);
-    if (!talkgroupId.success || !timestamp.success || !duration.success || fields.enc !== 'mp3') {
-      return reply.code(400).type('text/plain').send('1 Invalid-Call-Metadata');
-    }
-    const receivedAt = new Date(timestamp.data * 1000);
-    if (!Number.isFinite(receivedAt.getTime())) return reply.code(400).type('text/plain').send('1 Invalid-Timestamp');
-    const externalId = `sdrtrunk-${systemId.data}-${talkgroupId.data}-${timestamp.data}-${(fields.src ?? '0').slice(0,100)}`;
-    const prior = await query<{ id: string; status: string }>('SELECT id,status FROM radio_upload_sessions WHERE external_id=$1', [externalId]);
-    if (prior.rows[0]?.status === 'complete') return reply.type('text/plain').send('1 SKIPPED duplicate call');
-    if (prior.rows[0]?.status === 'uploading') return reply.type('text/plain').send('1 UPLOAD-IN-PROGRESS');
-    const sessionId = prior.rows[0]?.id ?? randomUUID();
-    if (prior.rows[0]) {
-      await query(`UPDATE radio_upload_sessions SET status='pending',expires_at=now() + interval '10 minutes'
-        WHERE id=$1 AND status IN ('pending','failed')`, [sessionId]);
-    } else {
-      await query(`INSERT INTO radio_upload_sessions(id,radio_key_id,external_id,talkgroup_id,system_id,received_at,metadata,expires_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,now() + interval '10 minutes')`, [sessionId, keyId, externalId, talkgroupId.data, systemId.data, receivedAt, { callDuration: duration.data, sourceId: fields.src ?? '0', sourceAlias: fields.srcId_alias ?? null, frequencyMhz: fields.freq ?? null }]);
-    }
-    const origin = (process.env.PUBLIC_BASE_URL || `${request.protocol}://${request.headers.host}`).replace(/\/$/, '');
-    return reply.type('text/plain').send(`0 ${origin}/api/radio-upload/${sessionId}`);
-  } catch (error) {
-    request.log.error({ error }, 'SDRTrunk metadata upload failed');
-    return reply.code(400).type('text/plain').send('1 Invalid-Call-Metadata');
-  }
-});
-
-app.put('/api/radio-upload/:sessionId', async (request, reply) => {
-  const { sessionId } = request.params as { sessionId: string };
-  if (!z.string().uuid().safeParse(sessionId).success || !Buffer.isBuffer(request.body) || request.body.length < 100 || request.body.length > 64 * 1024 * 1024) {
-    return reply.code(400).type('text/plain').send('Invalid audio upload');
-  }
-  let upload: Record<string, any> | null;
-  try {
-    upload = await transaction(async tx => {
-      const session = await tx.query(`SELECT s.*,k.enabled AS key_enabled FROM radio_upload_sessions s
-        JOIN radio_api_keys k ON k.id=s.radio_key_id WHERE s.id=$1 FOR UPDATE OF s`, [sessionId]);
-      const row = session.rows[0];
-      if (!row || !row.key_enabled || row.status !== 'pending' || new Date(row.expires_at).getTime() < Date.now()) return null;
-      await tx.query("UPDATE radio_upload_sessions SET status='uploading' WHERE id=$1", [sessionId]);
-      return row;
-    });
-    if (!upload) return reply.code(404).type('text/plain').send('Upload session expired');
-    const stored = await storeInboundRadioCall({
-      systemId: upload.system_id, talkgroupId: upload.talkgroup_id, receivedAt: new Date(upload.received_at),
-      externalId: upload.external_id, audio: request.body, audioMime: 'audio/mpeg', metadata: upload.metadata, keyId: upload.radio_key_id
-    });
-    await query("UPDATE radio_upload_sessions SET status='complete' WHERE id=$1", [sessionId]);
-    return reply.type('text/plain').send(stored.duplicate ? '200' : '200');
-  } catch (error) {
-    await query("UPDATE radio_upload_sessions SET status='failed' WHERE id=$1 AND status='uploading'", [sessionId]).catch(() => undefined);
-    request.log.error({ error, sessionId }, 'SDRTrunk audio upload failed');
-    return reply.code(500).type('text/plain').send('Audio upload failed');
-  }
+app.get('/api/receiver-requests', { preHandler: [requireRoles(...roles)] }, async (request, reply) => {
+  const input = z.object({ afterId: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(250).default(100) }).safeParse(request.query);
+  if (!input.success) return reply.code(400).send({ error: 'Invalid receiver request query' });
+  const result = await query(`SELECT id,received_at,method,path,status_code,system_id,talkgroup_id,summary,details
+    FROM receiver_requests WHERE id > $1 ORDER BY id DESC LIMIT $2`, [input.data.afterId, input.data.limit]);
+  return { requests: result.rows.reverse() };
 });
 
 app.get('/api/incidents', { preHandler: [requireRoles(...roles)] }, async (request, reply) => {
-  const filters = z.object({ status: z.string().max(32).optional(), talkgroup: z.string().max(100).optional(), q: z.string().max(120).optional(), limit: z.coerce.number().int().min(1).max(100).default(50), offset: z.coerce.number().int().min(0).default(0) }).safeParse(request.query);
+  const filters = z.object({ status: z.string().max(32).optional(), talkgroup: z.string().max(100).optional(), q: z.string().max(120).optional(), callsOnly: z.enum(['true','false']).default('false'), limit: z.coerce.number().int().min(1).max(100).default(50), offset: z.coerce.number().int().min(0).default(0) }).safeParse(request.query);
   if (!filters.success) return reply.code(400).send({ error: 'Invalid filters' });
-  const { status, talkgroup, q, limit, offset } = filters.data;
-  const result = await query(`SELECT i.id,i.talkgroup_id,i.event_type,i.status,i.received_at,i.public_data,i.image_id,
+  const { status, talkgroup, q, callsOnly, limit, offset } = filters.data;
+  const result = await query(`SELECT i.id,i.talkgroup_id,i.event_type,i.status,i.priority,i.received_at,i.public_data,i.image_id,
       i.facebook_post_id,i.publish_error,i.created_at,t.label AS talkgroup_label,im.name AS image_name
     FROM incidents i JOIN talkgroups t ON t.id=i.talkgroup_id LEFT JOIN images im ON im.id=i.image_id
     WHERE ($1::text IS NULL OR i.status=$1) AND ($2::text IS NULL OR i.talkgroup_id=$2)
     AND ($3::text IS NULL OR concat_ws(' ',i.public_data->>'jurisdiction',i.public_data->>'call',i.public_data->>'location',t.label) ILIKE '%' || $3 || '%')
-    ORDER BY i.received_at DESC LIMIT $4 OFFSET $5`, [status ?? null, talkgroup ?? null, q ?? null, limit, offset]);
+    AND ($4::boolean=false OR i.priority IN ('high','medium'))
+    ORDER BY i.received_at DESC LIMIT $5 OFFSET $6`, [status ?? null, talkgroup ?? null, q ?? null, callsOnly === 'true', limit, offset]);
   const incidents = ['Admin','Reviewer'].includes(request.user.role) ? result.rows : result.rows.map(row => ({ ...row, publish_error: null }));
   return { incidents, limit, offset };
 });
@@ -354,10 +338,9 @@ app.get('/api/incidents/:id', { preHandler: [requireRoles(...roles)] }, async (r
 });
 
 app.post('/api/incidents', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
-  const input = z.object({ talkgroupId: z.string().min(1), publicData: publicPostSchema }).safeParse(request.body);
+  const input = z.object({ talkgroupId: z.string().trim().min(1).max(100), publicData: publicPostSchema }).safeParse(request.body);
   if (!input.success) return reply.code(400).send({ error: 'Invalid manual post', details: input.error.flatten() });
-  const talkgroup = await query('SELECT id FROM talkgroups WHERE id=$1 AND enabled=true', [input.data.talkgroupId]);
-  if (!talkgroup.rowCount) return reply.code(400).send({ error: 'Select a configured talkgroup' });
+  await ensureTalkgroup(input.data.talkgroupId);
   const safe = sanitizePublicPost(input.data.publicData, '', { applyPrivacyFilters: false });
   safe.suggestedImage = null;
   const id = randomUUID();
@@ -465,6 +448,16 @@ app.patch('/api/incidents/:id', { preHandler: [requireRoles('Admin', 'Reviewer')
   return { saved: true, publicData: safe };
 });
 
+app.patch('/api/incidents/:id/priority', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const input = z.object({ priority: z.enum(['high','medium','low']) }).safeParse(request.body);
+  if (!input.success) return reply.code(400).send({ error: 'Priority must be high, medium, or low' });
+  const updated = await query('UPDATE incidents SET priority=$2,updated_at=now() WHERE id=$1 RETURNING id,priority', [id, input.data.priority]);
+  if (!updated.rowCount) return reply.code(404).send({ error: 'Incident not found' });
+  await audit(request.user.sub, 'incident.priority_changed', id, { priority: input.data.priority });
+  return { priority: input.data.priority };
+});
+
 app.post('/api/incidents/:id/approve', { preHandler: [requireRoles('Admin', 'Reviewer')] }, async (request, reply) => {
   const { id } = request.params as { id: string };
   const result = await transaction(async tx => {
@@ -548,16 +541,13 @@ app.get('/api/radio-keys', { preHandler: [requireRoles('Admin')] }, async () => 
 }));
 
 app.post('/api/radio-keys', { preHandler: [requireRoles('Admin')] }, async (request, reply) => {
-  const input = z.object({ name: z.string().trim().min(1).max(100), systemId: z.string().trim().regex(/^\d+$/).max(50), talkgroupIds: z.array(z.string().min(1).max(100)).min(1).max(100) }).safeParse(request.body);
-  if (!input.success) return reply.code(400).send({ error: 'Name, system ID, and at least one talkgroup are required' });
-  const talkgroupIds = [...new Set(input.data.talkgroupIds)];
-  const configured = await query<{ id: string }>('SELECT id FROM talkgroups WHERE enabled=true AND id=ANY($1::text[])', [talkgroupIds]);
-  if (configured.rowCount !== talkgroupIds.length) return reply.code(400).send({ error: 'Keys can only include enabled configured talkgroups' });
+  const input = z.object({ name: z.string().trim().min(1).max(100), systemId: z.string().trim().regex(/^\d+$/).max(50) }).safeParse(request.body);
+  if (!input.success) return reply.code(400).send({ error: 'Name and numeric system ID are required' });
   const apiKey = `rdio_${randomBytes(32).toString('base64url')}`;
   const result = await query<{ id: string }>(`INSERT INTO radio_api_keys(name,key_hash,system_id,talkgroup_ids,created_by)
-    VALUES ($1,$2,$3,$4,$5) RETURNING id`, [input.data.name, hashToken(apiKey), input.data.systemId, talkgroupIds, request.user.sub]);
-  await audit(request.user.sub, 'radio_api_key.created', null, { keyId: result.rows[0]!.id, name: input.data.name, systemId: input.data.systemId, talkgroupIds });
-  return reply.code(201).send({ id: result.rows[0]!.id, apiKey, name: input.data.name, systemId: input.data.systemId, talkgroupIds });
+    VALUES ($1,$2,$3,'{}',$4) RETURNING id`, [input.data.name, hashToken(apiKey), input.data.systemId, request.user.sub]);
+  await audit(request.user.sub, 'radio_api_key.created', null, { keyId: result.rows[0]!.id, name: input.data.name, systemId: input.data.systemId });
+  return reply.code(201).send({ id: result.rows[0]!.id, apiKey, name: input.data.name, systemId: input.data.systemId, talkgroupIds: [] });
 });
 
 app.delete('/api/radio-keys/:id', { preHandler: [requireRoles('Admin')] }, async (request, reply) => {
@@ -569,13 +559,6 @@ app.delete('/api/radio-keys/:id', { preHandler: [requireRoles('Admin')] }, async
 });
 
 app.get('/api/talkgroups', { preHandler: [requireRoles(...roles)] }, async () => ({ talkgroups: (await query('SELECT * FROM talkgroups ORDER BY label')).rows }));
-app.post('/api/talkgroups', { preHandler: [requireRoles('Admin')] }, async (request, reply) => {
-  const input = z.object({ id: z.string().trim().min(1).max(100), label: z.string().trim().min(1).max(120), enabled: z.boolean().default(true) }).safeParse(request.body);
-  if (!input.success) return reply.code(400).send({ error: 'Invalid talkgroup' });
-  await query('INSERT INTO talkgroups(id,label,enabled) VALUES ($1,$2,$3) ON CONFLICT(id) DO UPDATE SET label=$2,enabled=$3', [input.data.id, input.data.label, input.data.enabled]);
-  await audit(request.user.sub, 'talkgroup.saved', null, input.data);
-  return reply.code(201).send({ saved: true });
-});
 
 app.get('/api/images', { preHandler: [requireRoles(...roles)] }, async () => ({ images: (await query('SELECT id,name,location,enabled FROM images ORDER BY location,name')).rows }));
 app.get('/api/images/:id/file', { preHandler: [requireRoles(...roles)] }, async (request, reply) => {

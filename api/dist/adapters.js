@@ -14,11 +14,17 @@ export class OpenAICompatibleWhisper {
         const baseUrl = process.env.WHISPER_BASE_URL;
         if (!baseUrl)
             throw new Error('WHISPER_BASE_URL is not configured');
+        const inferencePath = process.env.WHISPER_API_PATH ?? '/audio/transcriptions';
         const form = new FormData();
         form.append('file', new Blob([Uint8Array.from(audio)]), 'incident.mp3');
-        form.append('model', process.env.WHISPER_MODEL ?? 'whisper-1');
-        const response = await fetch(`${baseUrl.replace(/\/$/, '')}/audio/transcriptions`, {
-            method: 'POST', headers: process.env.WHISPER_API_KEY ? { Authorization: `Bearer ${process.env.WHISPER_API_KEY}` } : {}, body: form, signal: AbortSignal.timeout(120_000)
+        if (inferencePath === '/inference') {
+            form.append('response_format', 'json');
+            form.append('temperature', '0');
+        }
+        else
+            form.append('model', process.env.WHISPER_MODEL ?? 'whisper-1');
+        const response = await fetch(`${baseUrl.replace(/\/$/, '')}${inferencePath}`, {
+            method: 'POST', headers: process.env.WHISPER_API_KEY ? { Authorization: `Bearer ${process.env.WHISPER_API_KEY}` } : {}, body: form, signal: AbortSignal.timeout(180_000)
         });
         if (!response.ok)
             throw new Error(`Transcription provider returned ${response.status}`);

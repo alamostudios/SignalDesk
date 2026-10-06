@@ -11,6 +11,7 @@ import { claimNextJob, completeJob, failJob, onWorkerWake, setWorkerOnline } fro
 import { hasMatchingApproval, renderOfficialPost, publicPostSchema } from './types.js';
 import { sanitizePublicPost } from './privacy.js';
 import { detectConfiguredTones } from './tones.js';
+import { suggestCall, suggestPriority } from './priorities.js';
 import { storage } from './storage.js';
 const execFileAsync = promisify(execFile);
 const transcriber = new OpenAICompatibleWhisper();
@@ -66,10 +67,11 @@ async function processIncident(incidentId) {
             if (!prepared.rowCount)
                 return;
             const transcript = process.env.WHISPER_BASE_URL ? await transcriber.transcribe(await storage.read(playableKey)) : '';
+            const priority = suggestPriority(transcript);
             await query("UPDATE incidents SET transcript=$2,updated_at=now() WHERE id=$1 AND status='processing'", [incidentId, transcript]);
             if (incident.event_type === 'manual') {
                 await query(`UPDATE incidents SET playable_path=$2,transcript=$3,source_metadata=source_metadata || $4::jsonb,
-          status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, { pageTone: tone }]);
+          priority=$5,status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, { pageTone: tone }, priority]);
                 return;
             }
             const images = await query('SELECT id, location, name FROM images WHERE enabled=true');
@@ -79,15 +81,16 @@ async function processIncident(incidentId) {
                 ? await reasoner.extract(transcript, receivedAt, images.rows.map(image => image.name))
                 : null;
             const privateData = extraction
-                ? { exactAddress: extraction.exactAddress ?? null, rawExtraction: extraction }
-                : { processingNote: 'Configure transcription and reasoning providers, or complete this draft manually.' };
+                ? { exactAddress: extraction.exactAddress ?? null, rawExtraction: extraction, prioritySuggestion: priority }
+                : { processingNote: transcript ? 'Reasoning AI is not configured; complete this draft manually.' : 'Transcription is not configured; complete this draft manually.', prioritySuggestion: priority };
+            const suggestedCall = suggestCall(transcript);
             const safe = extraction
                 ? sanitizePublicPost({ ...extraction, timeReceived }, transcript)
-                : sanitizePublicPost({ jurisdiction: 'Jurisdiction review required', call: 'Sensitive incident', location: '', extraInfo: '', timeReceived, sensitivity: 'high', suggestedImage: null }, transcript);
+                : sanitizePublicPost({ jurisdiction: 'Review required', call: suggestedCall ?? 'Radio call details pending', location: '', extraInfo: '', timeReceived, sensitivity: 'low', suggestedImage: null }, transcript);
             const image = extraction ? images.rows.find(item => item.name === safe.suggestedImage || item.location.toLowerCase() === safe.jurisdiction.toLowerCase()) : undefined;
             safe.suggestedImage = image?.name ?? null;
             await query(`UPDATE incidents SET playable_path=$2,transcript=$3,internal_data=$4,public_data=$5,
-        image_id=$6,source_metadata=source_metadata || $7::jsonb,status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, privateData, publicPostSchema.parse(safe), image?.id ?? null, { pageTone: tone }]);
+        image_id=$6,source_metadata=source_metadata || $7::jsonb,priority=$8,status='draft',updated_at=now() WHERE id=$1 AND status='processing'`, [incidentId, playableKey, transcript, privateData, publicPostSchema.parse(safe), image?.id ?? null, { pageTone: tone }, priority]);
         }
         finally {
             await Promise.allSettled(stagedSources.map(source => source.cleanup()));
@@ -233,5 +236,4 @@ async function recoverInterruptedJobs() {
             await query("UPDATE background_jobs SET status='failed',last_error=$2,updated_at=now() WHERE id=$1", [job.id, message]);
         }
     }
-    await query("DELETE FROM radio_upload_sessions WHERE status IN ('complete','failed') AND created_at < now() - interval '1 day'");
 }

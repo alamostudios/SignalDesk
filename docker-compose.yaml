@@ -1,0 +1,62 @@
+services:
+  signaldesk:
+    build: .
+    depends_on:
+      whisper:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "${PORT:-3000}"
+      DATA_DIR: /app/data
+      STORAGE_DIR: /app/storage
+      JWT_SECRET: "${JWT_SECRET:-}"
+      PUBLIC_AUDIO_SECRET: "${PUBLIC_AUDIO_SECRET:-}"
+      INGEST_API_KEY: "${INGEST_API_KEY:-}"
+      BOOTSTRAP_ADMIN_EMAIL: "${BOOTSTRAP_ADMIN_EMAIL:-}"
+      BOOTSTRAP_ADMIN_PASSWORD: "${BOOTSTRAP_ADMIN_PASSWORD:-}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      TIME_ZONE: "${TIME_ZONE:-UTC}"
+      PAGE_TONE_HZ: "${PAGE_TONE_HZ:-1000,1500}"
+      PAGE_TONE_THRESHOLD: "${PAGE_TONE_THRESHOLD:-0.18}"
+      TONE_CORRELATION_SECONDS: "${TONE_CORRELATION_SECONDS:-180}"
+      WHISPER_BASE_URL: "${WHISPER_BASE_URL:-http://whisper:8080}"
+      WHISPER_API_PATH: "${WHISPER_API_PATH:-/inference}"
+      WHISPER_API_KEY: "${WHISPER_API_KEY:-}"
+      WHISPER_MODEL: "${WHISPER_MODEL:-whisper-1}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      FACEBOOK_PAGE_ID: "${FACEBOOK_PAGE_ID:-}"
+      FACEBOOK_ACCESS_TOKEN: "${FACEBOOK_ACCESS_TOKEN:-}"
+      FACEBOOK_GRAPH_VERSION: "${FACEBOOK_GRAPH_VERSION:-v23.0}"
+      ALLOW_PUBLIC_EXTRA_INFO: "${ALLOW_PUBLIC_EXTRA_INFO:-false}"
+    volumes:
+      - signaldesk-data:/app/data
+      - signaldesk-audio:/app/storage
+    restart: unless-stopped
+  whisper:
+    image: ghcr.io/ggml-org/whisper.cpp:main
+    entrypoint: ["/bin/sh", "-c"]
+    command: >-
+      if [ ! -f "/models/ggml-$${WHISPER_CPP_MODEL}.bin" ]; then
+      download-ggml-model.sh "$${WHISPER_CPP_MODEL}" /models; fi &&
+      exec whisper-server --host 0.0.0.0 --port 8080 --threads "$${WHISPER_THREADS}"
+      --language en --no-gpu --model "/models/ggml-$${WHISPER_CPP_MODEL}.bin" --convert
+    environment:
+      WHISPER_CPP_MODEL: "${WHISPER_CPP_MODEL:-tiny.en}"
+      WHISPER_THREADS: "${WHISPER_THREADS:-2}"
+    volumes:
+      - signaldesk-whisper-models:/models
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health | grep -q 'status.*ok'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 120s
+    restart: unless-stopped
+volumes:
+  signaldesk-data:
+  signaldesk-audio:
+  signaldesk-whisper-models:
